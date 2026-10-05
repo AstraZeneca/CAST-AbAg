@@ -2,19 +2,24 @@
 
 This file recognises the people who made meaningful contributions to CAST-AbAg.
 
-## Maintainer
+## Maintainers
 
-- **CAST-AbAg authors**
+- **Leon Gerard** — <leon.gerard@astrazeneca.com>
+- **Luwei Wang** — <luwei.wang1@astrazeneca.com>
 
 ## Core Software Contributors
 
 People who actively contributed production code in this repository.
 
-- **CAST-AbAg authors**
+- **Luwei Wang** — <luwei.wang1@astrazeneca.com>
 
 ## Scientific and Domain Contributors
 
 People who provided scientific direction, domain expertise, data curation, evaluation, or
-experiment design.
+experiment design. These are the authors of the accompanying paper.
 
-- **CAST-AbAg authors**
+- **Luwei Wang** — <luwei.wang1@astrazeneca.com>
+- **Ferran Gonzalez** — <ferran.gonzalez@astrazeneca.com>
+- **Xinheng He** — <xinheng.he@astrazeneca.com>
+- **Raimon Fabregat** — <raimon.fabregat@astrazeneca.com>
+- **Leon Gerard** — <leon.gerard@astrazeneca.com>
