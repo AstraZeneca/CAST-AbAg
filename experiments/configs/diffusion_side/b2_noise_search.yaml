@@ -1,0 +1,132 @@
+# NOISE SEARCH baseline.
+#
+# Evolutionary search over the INITIAL NOISE. Each candidate is a full sampling run with
+# steer=False and deterministic=True, so the ONLY thing that varies is z_T. It uses the SAME reward
+# machinery as CAST, so the reward is held fixed and only its POINT OF APPLICATION moves:
+#     CAST          reward acts ALONG THE TRAJECTORY (twisted proposal + SMC)
+#     noise_search  reward acts on the INITIAL NOISE ONLY (ES over z)
+# PROVENANCE. `noise_search_algo: cosyne` is a faithful port of
+# EvoTorch's Cosyne -- the method Jajal et al. 2506.00299 report as their best (of CoSyNE / PGPE /
+# SNES) -- reproducing tournament selection, one-point cross-over (or SBX when cosyne_eta > 0),
+# Gaussian mutation, and CosynePermutation including its exact rank-weighted probability
+#     prob_permute = 1 - (centered_rank + 0.5)**(1/solution_length)
+# verified against the EvoTorch source. The isotropic (mu,lambda) ES is kept as
+# `noise_search_algo: es` for reference but is NOT the baseline.
+#
+# ONE REMAINING DEVIATION: the reference holds candidates in the Gaussian high-density shell with a
+# QR ORTHONORMAL TRANSFORM of z_T (a rotation, exactly distribution-preserving), this port rescales
+# onto the shell via project_to_shell (the DNO guard, 2405.18881), which is only asymptotically the
+# same. In d ~ 10^4 the norm concentrates, so the two nearly coincide without being identical.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/b2_noise_search
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/b2_noise_search
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    # BUDGET. UNDER COSYNE THE COST IS NOT popsize x generations. Each generation decodes the
+    # children (2 x popsize, EvoTorch's default cross-over rate of 2.0) PLUS the permuted population
+    # (popsize) -- so 3 x popsize sampling runs per generation, on top of the initial population:
+    #     NFE = popsize + generations x 3 x popsize = 16 + 15 x 48 = 736 per seed
+    # against CAST's 723. That is 1.8% OVER, i.e. very slightly in the BASELINE's favour, which is
+    # the right direction to err for a baseline. (The isotropic `es` variant costs popsize per
+    # generation instead; if you switch noise_search_algo, RE-DERIVE this number.)
+    #
+    # ONE SEED, DELIBERATELY, AND IT IS A REAL TRADE-OFF. CAST spends its 723 over 4 conditionings.
+    # this spends 736 over ONE. Matching conditionings instead would leave 4 seeds x G=3 = 640 NFE,
+    # and THREE generations is barely any search -- it would cripple the baseline to win a bookkeeping
+    # point, which is the exact failure this file's provenance note warns about. The ES is designed to
+    # search deeply within one latent space, and G=15 also matches the paper's own reported horizon
+    # ("15 or 50 steps"). State the conditioning mismatch in the paper; do not fix it by starving the
+    # optimiser.
+    n_samples_per_seed: 180             # WRITE 180 per seed; 4 seeds gives the 720 pool.
+                                        # The ES still EVALUATES 16 + 15x48 = 736 and that is its
+                                        # NFE, so the extra 16 stay in the measured FLOPs (M4)
+                                        # where they belong. Do NOT cut the ES budget to 720 --
+                                        # that starves the optimiser to win a bookkeeping point.
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:                     # 20 MSA subsamples (block form; matches b0b); each runs a coupled population (the diffusion axis)
+      policy: random
+      depth: 1000
+      n_seeds: 4                        # FOUR conditionings, matching CAST's K=4 and the
+                                        # Best-of-N control's 4 x 180. Was 1.
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  diffusion_side: search
+  label: b2_noise_search
+  diffusion_search:
+    algorithm: noise_search
+    # TUNED FOR 4 x 180 AT AN EXACT 720 TOTAL, WITH EVERY MECHANISM STILL RUNNING.
+    #     NFE = popsize + generations x (num_children + popsize)
+    # The per-generation cost is children PLUS the permuted population, and `num_children` is a
+    # hyperparameter (EvoTorch's cross-over rate x popsize), not a structural constant. Leaving it at
+    # its 2.0 default forces 3 x popsize per generation, which at this budget bought only THREE
+    # generations. Setting the rate to 1.0 buys SEVEN, at an exact 180 per seed:
+    #     original   P=16, G=15, rate 2.0 -> 736 per seed x 1 seed  = 736 evaluated, 720 written
+    #     now        P=12, G=7,  rate 1.0 -> 180 per seed x 4 seeds = 720 evaluated, 720 written
+    #                12 + 7 x (12 + 12) = 180
+    #
+    # EVERY COSYNE STEP STILL RUNS, every generation: select the top quartile (3 of 12), tournament,
+    # one-point cross-over, Gaussian mutation, permute the population, evaluate, keep the best 12.
+    # Nothing is disabled and nothing is degenerate: the tournament pool is 3, not the 2 that a
+    # smaller popsize would leave, and cross-over produces a full 12 children per generation.
+    #
+    # WHY THIS SPLIT OF THE BUDGET. Exact solutions at NFE=180 with all mechanisms intact, best first:
+    #     G=7  P=12 C=12 rate 1.00   <- chosen: most generations at a standard cross-over rate
+    #     G=9  P=9  C=10 rate 1.11      more generations but only 2 in the top quartile
+    #     G=12 P=12 C=2  rate 0.17      cross-over becomes vestigial, 2 children per generation
+    #     G=3  P=18 C=36 rate 2.00      the paper's rate, but three generations is barely a search
+    # Depth was preferred over the cross-over rate because an ES improves across generations, and a
+    # rate of 1.0 is a standard setting rather than a crippled one.
+    #
+    # NFE now EQUALS the written count, so "write the best 180 of 180" performs no final selection.
+    # The search still shapes the pool, since later generations sample near what scored well, but
+    # there is no filtering step at the end. To restore the deep single-conditioning search instead,
+    # set BASE_SEEDS=1 with popsize 16, generations 15 and num_children 0.
+    popsize: 12                         # ES population per generation. NOT the paper's P=16:
+                                        # 18 x (1+3x3) = 180 is the only exact fit
+                                        # at a 720 total. Cost per generation is
+                                        # 3 x popsize (children 2P + permuted P).
+    generations: 7                     # NOT the paper's 15. See the RETUNED note above.
+    num_children: 12                   # cross-over rate 1.0, not EvoTorch's 2.0 default.
+                                        # Per generation: 12 children + 12 permuted = 24.
+                                        # is 3 x popsize (children 2P + permuted P), NOT P.
+    noise_search_algo: cosyne           # the published method; `es` is the isotropic fallback
+    tournament_size: 4
+    mutation_stdev: 0.1
+    mutation_probability: 0.0           # 0 => every element mutated (EvoTorch's None)
+    permute_all: false                  # rank-weighted permutation, EvoTorch's default
+    elitism_ratio: 0.0
+    cosyne_eta: 0.0                     # >0 switches one-point cross-over to SBX
+    # THE REWARD MUST MATCH THE ARM IT IS A BASELINE FOR, or this compares two different objectives.
+    # Without these the spec falls back to reward=ipsae -- a DIFFERENT objective from CAST's site CV,
+    # which would make the comparison meaningless while looking perfectly healthy.
+    reward: epitope
+    rmsd_subset: paratope
+    sweep_units: centroid_A
+    umbrella_sweep: "9,11,13,15"
+    site_hinge: true
+    site_huber_delta: 4.0
+    contact_weight: 0.0
+    epitope_source: predicted
+    epitope_map_builder: hybrid_modes_tiles
+    sigma0: 0.5                         # initial ES step size
+    elite_frac: 0.5
+    sigma_decay: 0.9
+    on_shell: true                      # renormalise candidates to |z| ~ sqrt(d) (DNO guard)

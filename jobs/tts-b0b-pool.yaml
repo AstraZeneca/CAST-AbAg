@@ -1,0 +1,760 @@
+# TTS B0.b Best-of-N grid, POOL-DRAINING WORKERS (cluster-agnostic template).
+#
+# Same experiment and same per-target work as a fixed-partition sweep (each target gets its full
+# n_seeds x n_samples grid, scientifically identical to the N-GPU run). The ONLY difference is how
+# targets are assigned to GPUs:
+#   * a fixed partition   = each shard owns a precomputed cost-balanced target
+#     subset and exits when its subset is done. The run finishes at the SLOWEST shard.
+#   * tts-b0b-pool.yaml   = SHARED QUEUE. N identical workers pull targets one at a time from a
+#     shared PVC queue (atomic mkdir claim), hold the GPU across many targets, and exit only when
+#     the queue is empty. The run finishes at ~total_cost / N_workers (no straggler tail), and a
+#     worker never releases its GPU between targets (keeps a held GPU inside your own job set).
+#
+# WHEN TO USE POOL over FIXED SHARDS (default to fixed shards):
+#   (a) MANY more targets than GPUs you can hold at once (drain a big queue through few held GPUs), or
+#   (b) VERY uneven per-target cost, so a fixed partition straggles on one heavy bin.
+# For an even ~13-target-per-shard run that all starts together, the pool's only gain is the
+# straggler tail (~20-30%) and it is not worth the extra claim-race machinery.
+#
+# NO CODE CHANGES: this template is PURE ORCHESTRATION. It calls exactly the same
+# experiments.scripts.{prepare_dataset,run_ablation} + method.trunk_side.wire_msa_from_dump +
+# the models.protenix2 auto chunk/offload memory model as the shard template. The pool vs fixed
+# choice lives entirely in this wrapper -- nothing in the Python package knows or cares.
+#
+# HOW TO RUN (submit N_WORKERS worker jobs + one merge job):
+#   for k in 0 1 2 3; do WORKER_ID=$k N_WORKERS=4  <submit this template> ; done   # 4 GPU workers
+#   WORKER_ID=merge N_WORKERS=4                     <submit this template>          # merge + evaluate
+# Workers run in any order / at any time, each drains the shared queue until it is empty (all targets
+# in done/ or failed/). The merge job waits for done+failed==total then scores + evaluates.
+#
+# KEEP N WORKERS ALIVE (maintain throughput when a worker dies, e.g. host-OOM SIGKILL): the pool is
+# self-healing at the QUEUE level (survivors reclaim the dead worker's orphaned claim and keep
+# draining, so the run always COMPLETES), but a dead worker lowers parallelism. To hold the worker
+# COUNT while the pool still has work, let the platform RESTART a failed worker job -- set the worker
+# Job's backoffLimit > 0 (raw k8s) or resubmit a dead WORKER_ID. A restarted worker safely REJOINS
+# the pool (just claims remaining targets), it does NOT double-run (atomic claim), and it does NOT
+# restart-loop on a target that never fits (that target dead-letters after MAX_ATTEMPTS and the
+# worker moves on). A restarted worker that finds the pool already drained exits 0 immediately.
+#
+# PARTIAL / RE-MERGE: it is fine to merge while some targets are dead-lettered -- the merge scores
+# whatever predictions exist (the parquet just omits the failed targets, which are listed in failed/).
+# The merge is IDEMPOTENT and stateless: it re-scores ALL targets found in predictions_dir. So if a
+# dead-lettered target is later completed (resubmit it with more RAM -> its cifs land in the shared
+# predictions dir), just RE-RUN the merge job and it automatically picks up the new target and
+# rewrites per_sample.parquet -- no incremental-merge bookkeeping needed.
+#
+# CLUSTER-AGNOSTIC: everything cluster-specific is an env var or a <PLACEHOLDER> below.
+
+command_script: |
+  set -e
+
+  # ---- code (adapt or replace with your own checkout/mount) ----
+  REPO_ROOT="${REPO_ROOT:-$PWD}"                 # dir containing the Protein-TTS package
+  cd "$REPO_ROOT"
+
+  # ---- job parameters (override per run) ----
+  export RUN_DIR="${RUN_DIR:-./runs/b0b_pool}"                # shared output root (all workers + merge + queue)
+  export BAD_CASES_DIR="${BAD_CASES_DIR:-./data/collected_bad_cases/bad_cases}"
+  export MSA_DB="${MSA_DB:-./data/msa_db/collected_bad_cases}"
+  # WHICH DATASET. Two ways in, and they are exclusive: either the dataset is PREPARED here (DATASET + DATASET_ARGS), or an already-prepared
+  # wired directory is REUSED (REUSE_WIRED=1 + INPUTS_WIRED + GT_INDEX). Reuse suits a dataset whose
+  # MSA dumps are named differently from its targets, because it skips re-wiring entirely.
+  export DATASET="${DATASET:-collected_bad_cases}"
+  export DATASET_ARGS="${DATASET_ARGS:-{\"bad_cases_dir\": \"$BAD_CASES_DIR\"}}"
+  # REUSE IS OPT-IN BY ITS OWN FLAG, not by INPUTS_WIRED being set. env_pool.sh already exports
+  # INPUTS_WIRED for the steering templates, so branching on it would silently reroute every
+  # existing b0b launch that sources that file, which is a silent behaviour change.
+  export REUSE_WIRED="${REUSE_WIRED:-0}"         # 1 = reuse $INPUTS_WIRED instead of preparing
+  export INPUTS_WIRED="${INPUTS_WIRED:-}"        # the prepared+wired dir to reuse
+  export GT_INDEX="${GT_INDEX:-}"                # required when REUSE_WIRED=1, unused otherwise
+  export TARGETS="${TARGETS:-}"                  # space-separated subset; empty = every target
+  # WHICH CO-FOLDING MODEL. These two move together and nothing else has to change to switch models:
+  #   TTS_CONFIG=experiments/configs/baseline/b0b_opendde.yaml BACKEND=opendde
+  # b0b_opendde.yaml is b0b.yaml with only the backend block swapped, so the sampling budget is
+  # identical and the MODEL is the single difference. A per-backend copy of this template is not
+  # needed and should not be created: its whole functional delta would be these two defaults plus
+  # the two backend-conditional blocks below, and a near-duplicate worker drifts from this one
+  # silently.
+  TTS_CONFIG="${TTS_CONFIG:-experiments/configs/baseline/b0b.yaml}"
+  BACKEND="${BACKEND:-protenix2}"
+  # Same name as every other pool template, so the scoring reader is set one way project-wide.
+  SCORE_BACKEND="${SCORE_BACKEND:-$BACKEND}"
+  # VALIDATE THE NAME, because $BACKEND is interpolated into config keys. Full note in tts-cast-pool.yaml.
+  case "$BACKEND" in
+    protenix2|opendde) ;;
+    *) echo "!! BACKEND=$BACKEND is not a known backend (protenix2|opendde)"; exit 2 ;;
+  esac
+
+  # ---- CONFIG MUST FOLLOW THE BACKEND, and this template cannot derive it for you ----
+  # The pool templates that queue SEVERAL arms carry cfg_for_backend(), which appends
+  # $TTS_CFG_SUFFIX to whatever config each arm selects. This template selects exactly one config,
+  # so it takes TTS_CONFIG directly -- but that leaves the hole cfg_for_backend was written to
+  # close: `BACKEND=opendde` WITHOUT the matching TTS_CONFIG runs the OpenDDE model against the
+  # Protenix config block, and nothing downstream reports it. The results are a full, healthy pool
+  # of the wrong thing.
+  #
+  # Two ways to be right, and it is an error to be neither:
+  #   TTS_CONFIG=experiments/configs/baseline/b0b_opendde.yaml BACKEND=opendde   (explicit)
+  #   TTS_CFG_SUFFIX=_opendde BACKEND=opendde                                     (derived, as the
+  #                                                                                other templates)
+  # A suffix naming a config that does not exist is a HARD FAILURE, never a silent fall back to the
+  # Protenix file, for the same reason it is in tts-cast-pool.yaml.
+  TTS_CFG_SUFFIX="${TTS_CFG_SUFFIX:-}"
+  if [ -n "$TTS_CFG_SUFFIX" ]; then
+    _c="${TTS_CONFIG%.yaml}${TTS_CFG_SUFFIX}.yaml"
+    [ -f "$_c" ] || { echo "!! no $BACKEND config: $_c (from $TTS_CONFIG)" >&2; exit 2; }
+    TTS_CONFIG="$_c"
+  fi
+  # The guard proper: a non-default backend whose config carries no matching marker. Checked by
+  # NAME because the config's own backend block is what the check is confirming, so reading it
+  # back would be circular. Set TTS_CFG_MARKER_OK=1 to run a deliberately mixed pair.
+  if [ "$BACKEND" != "protenix2" ] && [ -z "${TTS_CFG_MARKER_OK:-}" ]; then
+    case "$TTS_CONFIG" in
+      *"_${BACKEND}".yaml) ;;
+      *) echo "!! BACKEND=$BACKEND but TTS_CONFIG=$TTS_CONFIG does not name it." >&2
+         echo "   Pass TTS_CONFIG=...${BACKEND}.yaml, or TTS_CFG_SUFFIX=_$BACKEND, or set" >&2
+         echo "   TTS_CFG_MARKER_OK=1 if the mismatch is deliberate." >&2
+         exit 2 ;;
+    esac
+  fi
+  echo "[backend] $BACKEND  config=$TTS_CONFIG"
+
+  # ---- OpenDDE backend requirements, checked BEFORE a GPU is taken ----
+  # OpenDDE ships in its OWN venv (its dependency set conflicts with ours), so the backend shells out
+  # to that console script. Both vars are REQUIRED: an unset OPENDDE_BIN makes the backend derive a
+  # bare `python`, which cannot import runner.cli and fails every unit AFTER the job is admitted and
+  # holds a GPU. Staging recipe and the public source are in models/opendde.py.
+  if [ "$BACKEND" = "opendde" ]; then
+    export OPENDDE_ROOT_DIR="${OPENDDE_ROOT_DIR:?set OPENDDE_ROOT_DIR (holds the abag checkpoint)}"
+    export OPENDDE_BIN="${OPENDDE_BIN:?set OPENDDE_BIN to the opendde console script inside its venv}"
+    [ -x "$OPENDDE_BIN" ] || { echo "OPENDDE_BIN=$OPENDDE_BIN is not executable"; exit 2; }
+  fi
+  MSA_DEPTH="${MSA_DEPTH:-1000}"   # d=1000 is the depth every reported B0.b result uses
+  N_SAMPLES="${N_SAMPLES:-50}"
+  N_SEEDS="${N_SEEDS:-20}"                        # passed as --set below, so EXP_CIF and the run always agree
+  # BASE SUBSAMPLE SEED, so a second run can EXTEND a pool instead of redrawing it. The subsamples
+  # are built as `seed = spec.seed + i` for i in 0..n_seeds-1 (method/trunk_side/msa_inputs.py), so a
+  # follow-up run at the default seed=0 regenerates the SAME subsamples it already has and the extra
+  # structures are duplicates, which silently flattens any scaling curve drawn over them. Setting
+  # this to the first run's n_seeds continues the sequence instead. Default 0 leaves every existing
+  # arm byte-identical.
+  MSA_SUB_SEED="${MSA_SUB_SEED:-0}"
+  RANK_BY="${RANK_BY:-ranking_score}"
+
+  # ---- worker parameters ----
+  N_WORKERS="${N_WORKERS:-4}"                     # number of GPU workers draining the queue
+  WORKER_ID="${WORKER_ID:-0}"                     # 0..N_WORKERS-1 for a worker, or "merge" for the merge job
+  CLAIM_STALE_SEC="${CLAIM_STALE_SEC:-14400}"     # a claim with no progress for this long is treated as orphaned
+  # The claim dir's mtime is refreshed every 60s by the owning worker's heartbeat, so liveness is
+  # knowable in minutes even though CLAIM_STALE_SEC must stay conservative for reclaiming.
+  HB_FRESH_MIN="${HB_FRESH_MIN:-5}"               # `started` rewritten within this => live owner
+  DRAIN_IDLE_SEC="${DRAIN_IDLE_SEC:-900}"         # stop camping on a GPU after this long with nothing to do
+  MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"               # per-target OOM/failure retries before DEAD-LETTER (failed/); >=2 lets a GPU-OOM target retry with forced offload
+
+  # ---- auto memory management (single GPU, any card size) ----
+  export PROTENIX_CONF_OFFLOAD_TOKENS="${PROTENIX_CONF_OFFLOAD_TOKENS:-auto}"
+  # TOKEN-AXIS CHUNK, sized PER RUN from the targets' token counts. Full note in tts-cast-pool.yaml.
+  export PROTENIX_INFER_CHUNK_SIZE="${PROTENIX_INFER_CHUNK_SIZE:-auto}"
+
+  export PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE="${PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE:-auto}"
+  # Per-card on-GPU token ceiling (above it -> offload). Tunable per run, the runtime reads the one
+  # matching its DETECTED card. Lower them on a cluster whose card has less FREE memory than nominal.
+  export PROTENIX_MAX_ONGPU_TOKENS_40G="${PROTENIX_MAX_ONGPU_TOKENS_40G:-750}"   # ceiling on a 40GB
+                                                                                 # card. 750 not 800
+                                                                                 # because the model
+                                                                                 # is optimistic by
+                                                                                 # 5-7 GiB near the
+                                                                                 # top of the card
+  export PROTENIX_MAX_ONGPU_TOKENS_80G="${PROTENIX_MAX_ONGPU_TOKENS_80G:-950}"    # ceiling on an 80GB card
+  export PROTENIX_OOM_SKIP="${PROTENIX_OOM_SKIP:-1}"                            # on a GPU OOM: log the target + skip its remaining seeds (move to next target)
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  INFER_CHUNK_SIZE="${INFER_CHUNK_SIZE:-128}"
+
+  # THESE TWO SETS ARE PROTENIX-ONLY. They encode Protenix's memory model (peak = base +
+  # chunk*slope, calibrated on Protenix), and `model.protenix2.*` is not a key an OpenDDE config
+  # even has. Built HERE, after INFER_CHUNK_SIZE exists, because building it earlier is exactly the
+  # bug the retired opendde template shipped: `set -e` without `set -u` expands an unset variable to
+  # nothing and passes `infer_chunk_size=` in silence.
+  CHUNK_SETS=""
+  if [ "$BACKEND" = "protenix2" ]; then
+    CHUNK_SETS="--set model.protenix2.infer_chunk_size=$INFER_CHUNK_SIZE --set model.protenix2.dynamic_chunk_size=false"
+  fi
+
+  # ---- environment (adapt to your image) ----
+  # source <YOUR-VENV>/bin/activate
+  # export PROTENIX_COMPONENT_PATH=<YOUR-PROTENIX-VENV>
+  # export PROTENIX_ROOT_DIR=<YOUR-PROTENIX-CACHE>
+  export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  # ---- CHECKPOINT ROUTE, PER BACKEND ----
+  # GATED ON $BACKEND, because this whole block is about PROTENIX's weights. Ungated it ran on every
+  # OpenDDE unit too and printed "using PUBLIC weights (model_name=protenix-v2, root=...)" at the top
+  # of a run that never constructs a Protenix model, naming a cache path that need not exist. Inert,
+  # but the first line a reader sees was about the wrong model.
+  if [ "$BACKEND" = "protenix2" ]; then
+    # PRIVATE IMAGE CACHE FIRST, PUBLIC WEIGHTS AS THE FALLBACK.
+    # The image ships the private checkpoint under a baked cache, so that is the DEFAULT here and the
+    # variable only overrides it. A machine without that cache resolves to public weights instead, which
+    # are the same architecture (public_model_name is protenix-v2, never the mini), so a fallback changes
+    # the weights' provenance and not the model.
+    export PROTENIX_ROOT_DIR="${PROTENIX_ROOT_DIR:-${APP_ROOT:-/opt/cofold}/protenix/cache}"
+    # The public cache. Unset means "the package default", a different directory per image that cannot be
+    # pre-seeded or checked. Defaults to the private root so one cache serves both branches.
+    # Gated with PROTENIX_ROOT_DIR above, and it MUST be: this body runs under `set -u`, so once that
+  # variable is only set for Protenix, an ungated ${...:-$PROTENIX_ROOT_DIR} here aborts every
+  # OpenDDE run with "PROTENIX_ROOT_DIR: unbound variable" instead of falling back.
+  if [ "$BACKEND" = "protenix2" ]; then
+    export PROTENIX_PUBLIC_ROOT_DIR="${PROTENIX_PUBLIC_ROOT_DIR:-$PROTENIX_ROOT_DIR}"
+  fi
+    # THERE IS NO DOWNLOAD BRANCH. The only route to a "private" label is a checkpoint already
+    # sitting at the root, baked into the image or placed there by hand.
+    # Say which route WON before the GPU starts, rather than leaving it in a run log 20 minutes in.
+    python "$REPO_ROOT/jobs/tts_job_lib.py" checkpoint-route --code-tree "$REPO_ROOT" || true
+  else
+    # Same purpose for the second model: name the weights BEFORE the GPU starts. Mirrors
+    # OpenDDEBackend._resolve_checkpoint, which prefers the antibody-antigen checkpoint and otherwise
+    # lets the CLI resolve --model_name itself. A silent fallback here would mean the abag run and the
+    # general run are indistinguishable in the log.
+    _ckpt="$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt"
+    if [ -f "$_ckpt" ]; then
+      echo "[route] backend=opendde checkpoint=$_ckpt (antibody-antigen)"
+    else
+      echo "[route] backend=opendde checkpoint=MISSING at $_ckpt -> falling back to --model_name opendde_v1 (general)"
+    fi
+  fi
+
+  # ---- LAYER NORM: torch by default, fused kernel on request ----
+  # Protenix reads $LAYERNORM_TYPE once at import. "fast_layernorm" builds a CUDA extension and
+  # needs nvcc and ninja; anything else uses torch.nn.functional.layer_norm. torch is the default
+  # here so this template matches every other one. Set LAYERNORM_TYPE=fast_layernorm for the faster
+  # kernel, which is checked here rather than left to fail after a GPU is claimed. OpenDDE does not
+  # read this variable.
+  if [ "$BACKEND" = "protenix2" ]; then
+    export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
+    if [ "$LAYERNORM_TYPE" = "fast_layernorm" ]; then
+      python -c "import protenix.model.layer_norm.layer_norm" >/dev/null 2>&1 || {
+        echo "!! LAYERNORM_TYPE=fast_layernorm was asked for, but the fused extension cannot be"
+        echo "!! built here (no nvcc/CUDA_HOME/ninja?). Unset it to use the torch kernel."
+        exit 2; }
+      echo "[kernels] LAYERNORM_TYPE=fast_layernorm. Faster, but not bit-identical to the measured"
+      echo "[kernels] arms, which all ran torch. Say so if you report these numbers beside them."
+    else
+      echo "[kernels] LAYERNORM_TYPE=$LAYERNORM_TYPE"
+    fi
+  fi
+  nvidia-smi -L || true
+  # ---- REFUSE TO START ON AN OCCUPIED CARD ---- (full note in tts-cast-pool.yaml)
+  _gpu_idx="${CUDA_VISIBLE_DEVICES:-}"; _gpu_idx="${_gpu_idx%%,*}"
+  case "${_gpu_idx:-}" in
+    "")       echo "[startup] occupied-card check skipped (no CUDA_VISIBLE_DEVICES)" ;;
+    *[!0-9]*) echo "[startup] occupied-card check skipped ($_gpu_idx is not a device index)" ;;
+    *)
+      _busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+              | awk -F', *' -v i="$_gpu_idx" '$1 == i {print $2}')
+      if [ -n "${_busy:-}" ] && [ "$_busy" -gt "$(( ${GPU_BUSY_GIB:-8} * 1024 ))" ]; then
+        echo "!! GPU $_gpu_idx already holds ${_busy} MiB, over the ${GPU_BUSY_GIB:-8} GiB start bar."
+        echo "!! On a multi-GPU pod EVERY worker needs its OWN device. Two workers on one card is"
+        echo "!! how a unit is lost to a fake size-OOM. Give this worker a free index, or raise"
+        echo "!! GPU_BUSY_GIB to share on purpose."
+        exit 5
+      fi
+      echo "[startup] GPU $_gpu_idx holds ${_busy:-0} MiB before this worker starts" ;;
+  esac
+  echo "WORKER_ID=$WORKER_ID / N_WORKERS=$N_WORKERS  MSA_DEPTH=$MSA_DEPTH  N_SAMPLES=$N_SAMPLES"
+
+  # The env file and the other pool templates name this SCORE_DOCKQ, the scoring paths below read
+  # DOCKQ_BIN. Without this line DOCKQ_BIN is empty and in-flight scoring no-ops silently.
+  DOCKQ_BIN="${DOCKQ_BIN:-${SCORE_DOCKQ:-}}"
+
+  EXP_CIF=$(( N_SEEDS * N_SAMPLES ))
+  QUEUE="$RUN_DIR/queue"; PENDING="$QUEUE/pending"; CLAIMED="$QUEUE/claimed"; DONE="$QUEUE/done"
+  FAILED="$QUEUE/failed"; ATT="$QUEUE/attempts"; FORCE="$QUEUE/force_offload"   # dead-letter, per-target attempt count, force-offload flags
+  PRED="$RUN_DIR/predictions"                     # shared: the atomic claim guarantees one worker per target,
+                                                  # so no two workers ever write the same {tid}__ dir (no races)
+
+  # ==================== IN-FLIGHT SCORING (drain workers) ====================
+  # Score a finished target's DockQ WHILE the next one runs on the GPU, so the merge finds the
+  # expensive metric already cached instead of doing all of it in one serial block at the end.
+  # The other four pool templates have done this for a long time (SCORE_JOBS + niced
+  # `evaluate --from-per-sample`); b0b was the only one without it.
+  #
+  # DEFINED AT TOP LEVEL, DELIBERATELY. The previous attempt, `warm_dockq`, was defined inside the
+  # `WORKER_ID = merge` branch below and called from the drain path, so `declare -F` never found it
+  # and it silently no-opped for every target of every b0b run ever done.
+  #
+  # COLLECTS THE MERGE'S WAY, NOT VIA --predictions-dir. That was the second half of why warm_dockq
+  # was worthless: the metric cache is keyed per (metric, sample) by _metric_spec, so only rows
+  # collected through run_ablation carry tags the merge will look up. Scoring the unit dirs directly
+  # yields tags like `<t>__random@d1000_s0__seed101__s1` against the merge's `<t>__seed0__s1`, and the
+  # merge then recomputes all of it anyway. The --predictions-dir route returns 0 records in
+  # 1 s because iter_predictions globs `<pred>/<target>/seed_*` and the units are `<target>__*`.
+  score_inflight () {                     # $1 = target id, $2 = its work dir (REMOVED when done)
+    local t="$1" src="$2"
+    if [ "${INFLIGHT_SCORE:-1}" != "1" ] || [ -z "${DOCKQ_BIN:-}" ]; then rm -rf "$src"; return 0; fi
+    # $src still holds ONLY this target's wired input, which is what scopes the collection to it.
+    nice -n 19 ionice -c 3 python -m experiments.scripts.run_ablation --skip-inference \
+      --config "$TTS_CONFIG" --set "model.backend=$BACKEND" \
+      --set "model.run.msa_subsample.source_inputs_dir=$src" \
+      --set "model.run.msa_subsample.depth=$MSA_DEPTH" \
+      --set "model.run.msa_subsample.n_seeds=$N_SEEDS" \
+      --set "model.run.msa_subsample.seed=$MSA_SUB_SEED" \
+      --set "model.run.n_samples_per_seed=$N_SAMPLES" \
+      --set "paths.inputs_dir=$src" --set "paths.predictions_dir=$PRED" \
+      --set "paths.results_dir=$src/results" \
+      --set "model.run.nproc_per_node=1" > "$src/collect.log" 2>&1 || {
+        echo "  inflight: $t collect failed (merge will redo it)"; rm -rf "$src"; return 0; }
+    timeout 3600 nice -n 19 ionice -c 3 "${SCORE_PY:-python}" -m experiments.scripts.evaluate \
+      --from-per-sample --results-dir "$src/results" \
+      --target-index "$RUN_DIR/target_index.csv" --backend "$SCORE_BACKEND" \
+      --metrics dockq --dockq-bin "$DOCKQ_BIN" > "$src/score.log" 2>&1 || {
+        echo "  inflight: $t score failed (merge will redo it)"; rm -rf "$src"; return 0; }
+    mkdir -p "$RUN_DIR/results/metrics/dockq"
+    # -n so a worker never overwrites another's cache entry; the tag already makes them disjoint.
+    cp -n "$src"/results/metrics/dockq/*.json "$RUN_DIR/results/metrics/dockq/" 2>/dev/null || true
+    echo "  inflight: $t cached $(ls "$src"/results/metrics/dockq 2>/dev/null | wc -l) DockQ results"
+    rm -rf "$src"
+  }
+
+  # =========================== MERGE MODE ===========================
+  if [ "$WORKER_ID" = "merge" ]; then
+    echo "=== MERGE: wait until every target is RESOLVED (done/ or failed/), then score done + evaluate ==="
+    # ---- CONCURRENT DockQ (cache warming). DockQ is CPU-only while inference is GPU-bound, so
+    # scoring the target just finished overlaps the next target's GPU work instead of being deferred
+    # to the merge. evaluate caches per (metric, sample) at {results_dir}/metrics/dockq/{tag}.json,
+    # and BOTH evaluate paths build that tag through the same _metric_spec, so a cache warmed here is
+    # found by the merge by construction -- no tag guessing.
+    # Scored into a PER-TARGET scratch dir, then only the cache jsons are copied into the shared
+    # results dir: several workers writing per_sample.parquet to one results_dir would clobber it.
+    warm_dockq () {                       # $1 = target id
+      [ "${WARM_DOCKQ:-1}" = "1" ] || return 0
+      [ -n "${DOCKQ_BIN:-}" ] || return 0
+      local t="$1" sc="$RUN_DIR/.dockq_warm/$t"
+      mkdir -p "$sc" "$RUN_DIR/results/metrics/dockq"
+      "${SCORE_PY:-python}" -m experiments.scripts.evaluate \
+        --predictions-dir "$PRED" --target-index "$RUN_DIR/target_index.csv" \
+        --results-dir "$sc" --backend "$SCORE_BACKEND" --metrics dockq \
+        --threads "${DOCKQ_THREADS:-16}" --dockq-bin "$DOCKQ_BIN" \
+        > "$sc/warm.log" 2>&1 || { echo "  warm_dockq: $t failed (merge will recompute)"; return 0; }
+      cp -n "$sc"/metrics/dockq/*.json "$RUN_DIR/results/metrics/dockq/" 2>/dev/null || true
+      echo "  warm_dockq: cached $(ls "$sc"/metrics/dockq 2>/dev/null | wc -l) DockQ results for $t"
+    }
+
+    while :; do
+      [ -f "$QUEUE/POPULATED" ] || { echo "waiting for queue init ..."; sleep 30; continue; }
+      total=$(cat "$QUEUE/N_TARGETS"); ndone=$(ls "$DONE" 2>/dev/null | wc -l); nfail=$(ls "$FAILED" 2>/dev/null | wc -l)
+      echo "  merge: done=$ndone failed=$nfail / $total $(date -u)"
+      [ $((ndone + nfail)) -ge "$total" ] && break     # gate on done+failed so a dead-lettered (unfittable) target never hangs the merge
+      sleep 60
+    done
+    nfail=$(ls "$FAILED" 2>/dev/null | wc -l)
+    [ "$nfail" -gt 0 ] && echo "MERGE: $nfail target(s) DEAD-LETTERED (never fit, see failed/ + oom_events.jsonl): $(ls "$FAILED" 2>/dev/null | tr '\n' ' ')"
+    mkdir -p "$RUN_DIR/results"
+    # score ALL targets from the shared predictions dir (CPU, no inference)
+    python -m experiments.scripts.run_ablation --skip-inference \
+      --config "$TTS_CONFIG" --set "model.backend=$BACKEND" \
+      --set "model.run.msa_subsample.source_inputs_dir=$RUN_DIR/inputs_wired" \
+      --set "model.run.msa_subsample.depth=$MSA_DEPTH" \
+      --set "model.run.msa_subsample.n_seeds=$N_SEEDS" \
+      --set "model.run.msa_subsample.seed=$MSA_SUB_SEED" \
+      --set "model.run.n_samples_per_seed=$N_SAMPLES" \
+      --set "paths.inputs_dir=$RUN_DIR/inputs" \
+      --set "paths.predictions_dir=$PRED" \
+      --set "paths.results_dir=$RUN_DIR/results" \
+      --set "model.run.nproc_per_node=1"
+    echo "=== Evaluate: ab-antigen DockQ + seeds x samples summary ==="
+    # ONE MISSING OPTIONAL TOOL USED TO NULL EVERY GROUND-TRUTH COLUMN. This is the only evaluate
+    # call in any pool template that takes the DEFAULT metric set, which is dockq. It stays
+    # explicit because the merge is the one place that pays for a wrong metric list across every
+    # structure in the run. `diversity` is a SILENT NO-OP on this path: --from-per-sample rebuilds
+    # records from the parquet, which carries no cif_path, so the per-target loop collects nothing
+    # and writes nothing, with no warning. Ask for a metric explicitly via EVAL_METRICS when a run
+    # genuinely needs it.
+    EVAL_METRICS="${EVAL_METRICS:-dockq}"
+    echo "[metrics] merge scoring: $EVAL_METRICS"
+    python -m experiments.scripts.evaluate --from-per-sample \
+      --results-dir  "$RUN_DIR/results" \
+      --target-index "$RUN_DIR/target_index.csv" \
+      --backend "$SCORE_BACKEND" --rank-by "$RANK_BY" \
+      ${DOCKQ_BIN:+--dockq-bin $DOCKQ_BIN} \
+      ${EVAL_METRICS:+--metrics $EVAL_METRICS} \
+      --summary \
+      --summary-seed-subsets 1,5,10,20 --summary-sample-subsets 1,5,10,50
+    echo "MERGE complete"; ls -lh "$RUN_DIR/results/per_sample.parquet"
+    exit 0
+  fi
+
+  # =========================== POOL INIT (once, atomic lock) ===========================
+  # The FIRST worker to win $QUEUE/.init_lock prepares inputs, wires MSA for ALL targets, and
+  # populates pending/ with one marker per target; every other worker waits for POPULATED.
+  mkdir -p "$PENDING" "$CLAIMED" "$DONE" "$FAILED" "$ATT" "$FORCE" "$PRED"
+  if mkdir "$QUEUE/.init_lock" 2>/dev/null; then
+    echo "=== worker $WORKER_ID: initializing pool ==="
+    if [ "$REUSE_WIRED" = "1" ]; then
+      # REUSE. No prepare and no re-wiring: the wired inputs already carry their MSA paths, and
+      # re-wiring would look the dump up at $MSA_DB/<target>, which misses whenever the dataset's
+      # targets are named differently from the directories its MSAs were built under.
+      [ -n "$INPUTS_WIRED" ] && [ -d "$INPUTS_WIRED" ] || { echo "!! REUSE_WIRED=1 needs INPUTS_WIRED to be an existing dir, got: '$INPUTS_WIRED'"; exit 2; }
+      [ -f "$GT_INDEX" ] || { echo "!! REUSE_WIRED=1 needs GT_INDEX (prepare would have written it): '$GT_INDEX'"; exit 2; }
+      mkdir -p "$RUN_DIR/inputs_wired"
+      _want="$TARGETS"
+      if [ -z "$_want" ]; then _want=$(for f in "$INPUTS_WIRED"/*.json; do basename "$f" .json; done); fi
+      for t in $_want; do
+        [ -f "$INPUTS_WIRED/$t.json" ] || { echo "!! INPUTS_WIRED has no input for $t"; exit 2; }
+        cp "$INPUTS_WIRED/$t.json" "$RUN_DIR/inputs_wired/"
+      done
+      # Everything downstream reads $RUN_DIR/target_index.csv, which prepare_dataset would have
+      # written. Copy the one the dataset ships rather than teaching four call sites a second path.
+      cp "$GT_INDEX" "$RUN_DIR/target_index.csv"
+      echo "reusing $(ls "$RUN_DIR"/inputs_wired/*.json | wc -l) wired input(s) from $INPUTS_WIRED"
+    else
+      if [ ! -d "$RUN_DIR/inputs" ]; then
+        python -m experiments.scripts.prepare_dataset \
+          --dataset "$DATASET" --dataset-args "$DATASET_ARGS" \
+          --backend "$SCORE_BACKEND" --out-dir "$RUN_DIR/inputs" --index-csv "$RUN_DIR/target_index.csv"
+      fi
+      # wire full MSAs onto every target (the prepared inputs carry none), and fail loudly on an
+      # empty or misconfigured MSA_DB. Shared logic in jobs/tts_job_lib.py.
+      python "$REPO_ROOT/jobs/tts_job_lib.py" wire-msas --run-dir "$RUN_DIR" --msa-db "$MSA_DB"
+      if [ -n "$TARGETS" ]; then
+        for f in "$RUN_DIR"/inputs_wired/*.json; do
+          case " $TARGETS " in *" $(basename "$f" .json) "*) ;; *) mv "$f" "$f.notrequested" ;; esac
+        done
+      fi
+    fi
+    # ONE DATASET. Membership, not existence: the reference tree and the index must cover exactly the
+    # targets that are about to be sampled. See jobs/tts_job_lib.py dataset-check.
+    _tids=$(for f in "$RUN_DIR"/inputs_wired/*.json; do basename "$f" .json; done | tr "\n" " ")
+    python "$REPO_ROOT/jobs/tts_job_lib.py" dataset-check --targets "$_tids" \
+      --inputs-wired "$RUN_DIR/inputs_wired" --gt-index "$RUN_DIR/target_index.csv" \
+      ${FOLDBENCH_ROOT:+--foldbench-root "$FOLDBENCH_ROOT"} \
+      || { echo "!! dataset-check failed: the run would mix datasets."; exit 2; }
+    # pending markers are named "<epoch-ns>__<tid>": the claim loop processes them in SORTED (FIFO)
+    # order, so a requeued (re-touched with a later timestamp) target lands at the BACK of the queue.
+    n=0; for f in "$RUN_DIR"/inputs_wired/*.json; do touch "$PENDING/$(date -u +%s%N)__$(basename "$f" .json)"; n=$((n+1)); done
+    echo "$n" > "$QUEUE/N_TARGETS"; touch "$QUEUE/POPULATED"
+    echo "worker $WORKER_ID populated pool with $n targets"
+  fi
+  # Bounded: an init that exits on a preflight failure leaves .init_lock behind with no POPULATED,
+  # and an unbounded wait would hold a GPU forever on a pool nothing will ever fill.
+  _w=0
+  while [ ! -f "$QUEUE/POPULATED" ]; do
+    [ "$_w" -ge "${INIT_WAIT_S:-900}" ] && {
+      echo "!! worker $WORKER_ID: $QUEUE/.init_lock is held but POPULATED never appeared after ${_w}s."
+      echo "!! The initialising worker died before populating the queue, most likely on a preflight"
+      echo "!! failure. Nothing will ever arrive. Delete $QUEUE and relaunch."; exit 2; }
+    echo "worker $WORKER_ID waiting for pool init ..."; sleep 5; _w=$((_w+5))
+  done
+
+  # ---- MEMORY WATCHDOG: make a HOST-RAM OOM a clean per-target failure instead of a pod kill ----
+  # A host-RAM OOM is normally an uncatchable kernel SIGKILL of the whole worker pod. This background
+  # guard watches the cgroup memory and, at ~MEMGUARD_PCT% of the limit, kills just the run_ablation
+  # CHILD before the kernel OOM-killer fires -- so the WORKER survives, the drain loop sees the target
+  # incomplete, and it is requeued-at-back / dead-lettered like any other failure. One target's OOM
+  # then never takes down the worker or the other targets. (cgroup v2: memory.current less the
+  # reclaimable file cache, over memory.max -- see the note on the subtraction below.)
+  MEMGUARD_PCT="${MEMGUARD_PCT:-92}"
+  MG_FLAG=/tmp/.memguard_fired          # pod-local: memguard drops this on a kill so the drain loop can tell
+                                        # a RAM-OOM kill (offload would NOT help) from a GPU-OOM (escalate to offload)
+  ( while true; do
+      cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+      max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+      # SUBTRACT RECLAIMABLE PAGE CACHE. memory.current counts the file cache, which the kernel
+      # evicts on demand and which therefore cannot cause an OOM-kill. A pod that has walked the
+      # shared volume reads memory.current at 100% of the limit while anon is near zero and
+      # inactive_file holds the rest, and the guard then kills every healthy run it claims, cycling
+      # through the whole shared queue in seconds. Any heavy file I/O does this, including the
+      # pool's own scoring, so the guard must measure the working set and not the cache.
+      # This block is the cast template's fix (tts-cast-pool.yaml), which was never backported here.
+      inact=$(awk '/^inactive_file /{print $2}' /sys/fs/cgroup/memory.stat 2>/dev/null || echo 0)
+      cur=$(( cur > inact ? cur - inact : 0 ))
+      case "$max" in ''|max|0) sleep 5; continue;; esac
+      pct=$(( cur * 100 / max ))
+      if [ "$pct" -ge "$MEMGUARD_PCT" ]; then
+        echo "[memguard] host RAM ${pct}% >= ${MEMGUARD_PCT}% of limit -> killing run_ablation to avert a pod OOM-kill $(date -u)"
+        touch "$MG_FLAG"
+          # KILL THE TREE, NOT JUST THE PARENT. Full note in tts-cast-pool.yaml.
+          for _p in $(pgrep -f "[r]un_ablation" 2>/dev/null); do
+            for _c in $(pgrep -P "$_p" 2>/dev/null); do
+              for _g in $(pgrep -P "$_c" 2>/dev/null); do kill -9 "$_g" 2>/dev/null; done
+              kill -9 "$_c" 2>/dev/null
+            done
+            kill -9 "$_p" 2>/dev/null
+          done
+          # Belt and braces: a backend process only ever exists under a live run_ablation, so once
+          # none is left, anything still running is an orphan whatever its parent now reads as.
+          sleep 2
+          if ! pgrep -f "[r]un_ablation" >/dev/null 2>&1; then
+            for _o in $(pgrep -f "[_]opendde_launch|[t]orch.distributed.run|runner[.]inference" 2>/dev/null); do
+              kill -9 "$_o" 2>/dev/null
+            done
+          fi
+          sleep 15
+      fi
+      sleep 3
+    done ) &
+  MG_PID=$!   # MUST be tracked. This memguard loop is UNBOUNDED and the drain-exit below ends
+              # with a bare `wait`, which waits for EVERY child -- so without killing it first
+              # the worker NEVER EXITS once the pool drains: it sits at 0%% GPU holding the card
+              # until the job deadline, which idles the card for hours.
+
+  # =========================== DRAIN LOOP ===========================
+  # Pull one target at a time (FIFO, atomic `mkdir claimed/$tid`), run it, retire to done/. On an OOM
+  # or incomplete result a target is REQUEUED AT THE BACK (so it never repeatedly hits fresh workers
+  # ahead of untried targets) and, after $MAX_ATTEMPTS, moved to failed/ (dead-letter) so the queue
+  # ALWAYS terminates -- even if some targets can never fit. A per-target failure NEVER exits the
+  # worker (it keeps draining), only an uncatchable host-OOM SIGKILL takes a worker down, and that
+  # target's orphaned claim is reclaimed by a surviving worker.
+  _fail() {   # $1=tid  $2=escalate(1 => force offload on the NEXT attempt; use for GPU-OOM, NOT host-OOM)
+    local tid="$1" esc="$2" n
+    n=$(( $(cat "$ATT/$tid" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$ATT/$tid"
+    if [ "$n" -ge "$MAX_ATTEMPTS" ]; then
+      echo "worker $WORKER_ID: $tid FAILED after $n attempt(s) -> DEAD-LETTER (failed/)"; touch "$FAILED/$tid"
+    else
+      [ "$esc" = "1" ] && touch "$FORCE/$tid"                 # next attempt forces full offload (GPU-OOM often fits then)
+      touch "$PENDING/$(date -u +%s%N)__$tid"                 # requeue at the BACK (later timestamp sorts last)
+      # `${esc:+...}` expands whenever esc is NON-EMPTY, so it would print "force-offload next"
+      # for esc=0 too, while the marker above is only written for esc=1. Every suppressed
+      # escalation would then LOG as if it had been armed, which hides a classifier fault for a
+      # whole run. Test the value, not its emptiness, and say so when it is NOT armed.
+      if [ "$esc" = "1" ]; then _escmsg=", force-offload next"; else _escmsg=", no escalation"; fi
+      echo "worker $WORKER_ID: $tid requeued at BACK (attempt $n/$MAX_ATTEMPTS$_escmsg)"
+    fi
+  }
+  n_did=0
+  # DEADLINE-AWARE CLAIMING. Full note in tts-cast-pool.yaml.
+  T0=$(date -u +%s)
+  DEADLINE_S="${DEADLINE_S:-0}"
+  UNIT_EST_S="${UNIT_EST_S:-43200}"
+  while :; do
+    GOT=""
+    # GRACEFUL DRAIN. `touch $QUEUE/STOP` and every worker finishes the target it is on, then exits
+    # without claiming another. Added because the only way to pick up a code change was to kill the
+    # workers, which discards whatever GPU time the in-flight targets had already spent -- up to a
+    # whole target each, three at a time. Checked HERE, before a claim, so it can never interrupt
+    # sampling already under way. Remove the file before relaunching.
+    if [ -f "$QUEUE/STOP" ]; then
+      echo "worker $WORKER_ID: STOP file present, exiting cleanly after $n_did target(s) -- nothing in flight discarded"
+      break
+    fi
+    if [ "$DEADLINE_S" -gt 0 ]; then
+      _left=$(( DEADLINE_S - ( $(date -u +%s) - T0 ) ))
+      if [ "$_left" -lt "$UNIT_EST_S" ]; then
+        echo "worker $WORKER_ID: ${_left}s left of the ${DEADLINE_S}s deadline, under the ${UNIT_EST_S}s"
+        echo "worker $WORKER_ID: a target needs -- exiting cleanly rather than starting one that dies at the wall"
+        break
+      fi
+    fi
+    for m in $(ls "$PENDING" 2>/dev/null | sort); do          # SORTED = FIFO; requeued targets are last
+      tid="${m##*__}"                                          # strip the "<epoch-ns>__" prefix
+      # checkpoint: already complete on disk? (cif AND pae-npz) -> retire to done/
+      nc=$(find "$PRED" -path "*/${tid}__*" -name '*.cif' 2>/dev/null | wc -l)
+      np=$(find "$PRED" -path "*/${tid}__*" -name '*_pae_sample_*.npz' 2>/dev/null | wc -l)
+      if [ "$nc" -ge "$EXP_CIF" ] && [ "$np" -ge "$EXP_CIF" ]; then rm -f "$PENDING/$m" 2>/dev/null; touch "$DONE/$tid"; continue; fi
+      if mkdir "$CLAIMED/$tid" 2>/dev/null; then               # atomic claim
+        rm -f "$PENDING/$m" 2>/dev/null; GOT="$tid"; date -u +%s > "$CLAIMED/$tid/started"; unset idle_since; break
+      fi
+    done
+    if [ -z "$GOT" ]; then
+      # nothing claimable -> reclaim a STALE orphan (a worker died mid-target, e.g. host-OOM SIGKILL)?
+      now=$(date -u +%s); reclaimed=""
+      for c in "$CLAIMED"/*; do
+        [ -e "$c" ] || continue; tid=$(basename "$c")
+        # FALL BACK TO THE CLAIM DIR'S OWN MTIME, NEVER TO 0. `started` is written AFTER the atomic
+        # `mkdir "$CLAIMED/$tid"` (see the claim loop above), so a claim observed inside that window --
+        # or left by a worker killed inside it -- has no `started`. With the old `|| echo 0` fallback
+        # the age became `now - 0`, about 1.79e9 seconds, which exceeds ANY threshold: every such claim
+        # was declared orphaned and reclaimed IMMEDIATELY, including one a live worker was running.
+        # That is how two workers end up on the same target, and how `_fail` requeues a unit that is
+        # still claimed, leaving it in pending AND claimed at once. The claim directory is created at
+        # claim time, so its mtime is the correct conservative stand-in.
+        st=$(cat "$c/started" 2>/dev/null || stat -c %Y "$c" 2>/dev/null || echo "$now")
+        case "$st" in ''|*[!0-9]*) st="$now" ;; esac      # unreadable/garbage -> treat as just claimed
+        if [ $((now - st)) -gt "$CLAIM_STALE_SEC" ]; then
+          echo "worker $WORKER_ID: reclaiming orphaned claim $tid (worker died, likely host-OOM)"
+          rm -rf "$PRED/${tid}__"* "$c" 2>/dev/null
+          _fail "$tid" 0                                       # host-OOM: requeue-at-back, NO force-offload (offload raises host RAM)
+          reclaimed=1; break
+        fi
+      done
+      [ -n "$reclaimed" ] && continue
+      # BOUNDED DRAIN CAMP. Waiting here for peers' claims holds a GPU at 0% for as long as the
+      # SLOWEST peer takes, which can idle most of a pool to the end of a run.
+      # The camp is NOT removed, because a worker that walked away from a recently-dead peer's claim
+      # would strand that unit. It is bounded instead. Leaving is safe once every outstanding claim
+      # provably has a LIVE owner, because the reclaim branch above runs at the top of every iteration
+      # for every worker, so a peer still running a unit re-enters this loop when it finishes and
+      # reclaims any later orphan. Liveness is settled by the heartbeat, which the owner rewrites every
+      # 60s. NOTE THE ASYMMETRY: CLAIM_STALE_SEC stays conservative because a false reclaim rm -rf's a
+      # live worker's predictions, whereas a false "peer is alive" merely defers an orphan.
+      if [ -z "$(ls "$PENDING" 2>/dev/null)" ] && [ -n "$(ls "$CLAIMED" 2>/dev/null)" ]; then
+        : "${idle_since:=$(date -u +%s)}"
+        # Read the `started` FILE, exactly as the reclaim branch above does. The heartbeat rewrites
+        # that file every 60s, and rewriting a file does NOT touch its parent directory's mtime, so a
+        # `find` on the claim DIR would report every long-running claim as ancient and this check
+        # would never fire.
+        _all_live=1; _now=$(date -u +%s)
+        for c in "$CLAIMED"/*; do
+          [ -e "$c" ] || continue
+          _st=$(cat "$c/started" 2>/dev/null || echo "")
+          case "$_st" in ''|*[!0-9]*) _all_live=0; continue ;; esac
+          [ "$(( _now - _st ))" -lt "$(( HB_FRESH_MIN * 60 ))" ] || _all_live=0
+        done
+        if [ "$_all_live" = "1" ] && [ "$(( $(date -u +%s) - idle_since ))" -ge "$DRAIN_IDLE_SEC" ]; then
+          kill "${MG_PID:-0}" 2>/dev/null || true
+          echo "worker $WORKER_ID: idle ${DRAIN_IDLE_SEC}s and all $(ls "$CLAIMED" | wc -l) outstanding claim(s) heartbeat < ${HB_FRESH_MIN}m (live owners), releasing the GPU"
+          wait
+          echo "worker $WORKER_ID: exiting early (did $n_did; done=$(ls "$DONE" 2>/dev/null | wc -l) failed=$(ls "$FAILED" 2>/dev/null | wc -l))"; break
+        fi
+      fi
+      # truly drained iff NOTHING pending AND NOTHING still claimed (in-flight by a live worker)
+      if [ -z "$(ls "$PENDING" 2>/dev/null)" ] && [ -z "$(ls "$CLAIMED" 2>/dev/null)" ]; then
+        kill "${MG_PID:-0}" 2>/dev/null || true   # stop the unbounded memguard BEFORE waiting
+        echo "worker $WORKER_ID: waiting for $(jobs -rp | wc -l) in-flight DockQ warmer(s)"; wait
+        echo "worker $WORKER_ID: pool drained, exiting (did $n_did; done=$(ls "$DONE" 2>/dev/null | wc -l) failed=$(ls "$FAILED" 2>/dev/null | wc -l))"; break
+      fi
+      sleep 10; continue                                       # others still working / claims in flight -> wait
+    fi
+
+    echo "worker $WORKER_ID CLAIMED $GOT $(date -u)"
+    _T0=$(date +%s)                                  # GPU SAMPLING WALL-TIME, see the DONE branch
+    SRC="$RUN_DIR/queue/work_$GOT"; rm -rf "$SRC"; mkdir -p "$SRC"
+    cp "$RUN_DIR/inputs_wired/$GOT.json" "$SRC/"
+    rm -rf "$PRED/${GOT}__"* 2>/dev/null                       # stale partial, this target is
+                                                                 # claimed exclusively here
+    OFF_ENV=""
+    [ -f "$FORCE/$GOT" ] && OFF_ENV="PROTENIX_CONF_OFFLOAD_TOKENS=1"   # escalated retry after a prior GPU-OOM: force full offload
+    rm -f "$MG_FLAG" 2>/dev/null                                       # clear the memguard flag before the run (set only if memguard kills)
+    # HEARTBEAT the claim while this target runs: refresh claimed/$GOT/started every 60s so a LIVE but
+    # SLOW worker (a target legitimately taking > CLAIM_STALE_SEC) is NEVER falsely reclaimed -- a
+    # false reclaim would rm -rf this worker's in-progress predictions AND double-run the target
+    # (two workers writing the same {tid}__ dir = clash). Only a DEAD worker stops the heartbeat, so
+    # only its claim ages out. Killed before the claim is released below.
+    ( while [ -d "$CLAIMED/$GOT" ]; do date -u +%s > "$CLAIMED/$GOT/started" 2>/dev/null; sleep 60; done ) &
+    HB_PID=$!
+    # SEED-GRANULAR RESUME, on the INFERENCE call only. This pool runs N_SEEDS=20 MSA
+    # subsamples per target and retires a target all-or-nothing, so a worker stopped at seed 15
+    # -- by preemption, by the deadline, or by the memguard's own `pkill -9 -f run_ablation`
+    # above -- regenerates all 20 on the retry. TTS_RESUME_SEEDS=1 makes run_ablation drop the
+    # INPUT of any seed whose predictions are already complete, it never touches predictions and
+    # never drops every input. Scoped to THIS invocation, not exported: the --skip-inference
+    # collection call must keep every seed input or it would collect a subset.
+    env $OFF_ENV TTS_RESUME_SEEDS="${TTS_RESUME_SEEDS:-1}" python -m experiments.scripts.run_ablation \
+      --config "$TTS_CONFIG" --set "model.backend=$BACKEND" \
+      --set "model.run.msa_subsample.source_inputs_dir=$SRC" \
+      --set "model.run.msa_subsample.depth=$MSA_DEPTH" \
+      --set "model.run.msa_subsample.n_seeds=$N_SEEDS" \
+      --set "model.run.msa_subsample.seed=$MSA_SUB_SEED" \
+      --set "model.run.n_samples_per_seed=$N_SAMPLES" \
+      $CHUNK_SETS \
+      --set "paths.inputs_dir=$SRC" \
+      --set "paths.predictions_dir=$PRED" \
+      --set "paths.results_dir=$SRC/results" \
+      --set "model.run.nproc_per_node=1" || true               # a nonzero run must NOT kill the worker; the count check below decides
+    kill "$HB_PID" 2>/dev/null || true                         # stop the heartbeat (|| true: a dead PID must not trip set -e)
+    # NB paths.inputs_dir=$SRC is per-worker (run_ablation WIPES <inputs_dir>/_seeded), predictions_dir=$PRED
+    # is shared but safe (atomic claim = one worker per target, merged-input staging is per-run in protenix2).
+    nc=$(find "$PRED" -path "*/${GOT}__*" -name '*.cif' 2>/dev/null | wc -l)
+    np=$(find "$PRED" -path "*/${GOT}__*" -name '*_pae_sample_*.npz' 2>/dev/null | wc -l)
+    if [ "$nc" -ge "$EXP_CIF" ] && [ "$np" -ge "$EXP_CIF" ]; then
+      echo "worker $WORKER_ID DONE $GOT (cif=$nc npz=$np)"; touch "$DONE/$GOT"
+      # PRESERVE THIS TARGET'"'"'S COMPUTE RECORD BEFORE $SRC IS REMOVED. run_ablation writes
+      # res/timing.json (wall by stage) and res/diffusion_compute.json (FLOPs) INTO the per-target
+      # work dir, and the in-flight scorer deletes that dir once DockQ is cached. Every steering
+      # template keeps its unit dirs and so keeps both files; this template did not, so the
+      # Best-of-N baseline was the ONE arm with no FLOPs and no stage wall time -- the arm every
+      # compute-budget comparison in the paper is measured against.
+      mkdir -p "$RUN_DIR/compute"
+      for _cf in timing.json diffusion_compute.json msa_build_compute.json; do
+        _src_cf=$(find "$SRC" -name "$_cf" 2>/dev/null | head -1)
+        [ -n "$_src_cf" ] && cp "$_src_cf" "$RUN_DIR/compute/${GOT}__$_cf" 2>/dev/null || true
+      done
+      # GPU SAMPLING WALL-TIME, PER TARGET. No other results artefact carries it:
+      # msa_build_compute.json covers the MSA stage and timing.json the merge's collect and score,
+      # while the GPU phase -- the one the FLOPs in compute_budget.csv are spent on -- would
+      # otherwise be recoverable only from queue marker mtimes or worker logs. Without it no
+      # FLOPs-per-second or wall-clock-against-budget figure can be read from the shipped results.
+      # One small json per target, aggregated by the merge.
+      _T1=$(date +%s)
+      mkdir -p "$RUN_DIR/timing_sampling"
+      printf '{"target":"%s","worker":"%s","host":"%s","n_structures":%s,"started_utc":"%s","finished_utc":"%s","sampling_wall_s":%s}\n' \
+        "$GOT" "$WORKER_ID" "${HOSTNAME:-$(hostname)}" "$nc" \
+        "$(date -u -d "@$_T0" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+        "$(date -u -d "@$_T1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)" \
+        "$((_T1 - _T0))" > "$RUN_DIR/timing_sampling/$GOT.json"
+      rm -rf "$CLAIMED/$GOT"; n_did=$((n_did+1))
+      # Score this target's DockQ WHILE the next one runs on the GPU. Capped so scorers cannot starve
+      # the sampler, and niced inside score_inflight for the same reason. $SRC is NOT removed here:
+      # score_inflight needs it (it holds the one wired input that scopes the collection) and removes
+      # it itself on every exit path.
+      while [ "$(jobs -rp | wc -l)" -ge "${DOCKQ_JOBS:-2}" ]; do wait -n 2>/dev/null || break; done
+      score_inflight "$GOT" "$SRC" &
+    else
+      # incomplete: release claim, requeue-at-back, dead-letter after MAX_ATTEMPTS. Worker CONTINUES.
+      # ESCALATE only for a GPU-OOM (offload fixes it): esc=1. A memguard/RAM-OOM kill (flag set) uses
+      # esc=0 -- offload RAISES host RAM, so forcing it would only make the retry fail the same way.
+      # CLASSIFY BEFORE ESCALATING. Escalating on ANY incomplete target would force
+      # confidence-offload after a plain crash and after a GPU OOM caused by ANOTHER PROCESS on the
+      # card. Offload fixes neither, and it makes every later attempt slower for a reason that was
+      # never true. There is no per-target log here (run_ablation writes to the shared worker stdout, where
+      # another target's OOM would be matched by mistake), so classify from THIS target's per-sample
+      # ERR captures. Unreadable/absent -> "none" -> esc=0, which is the safe default: not escalating
+      # costs one ordinary retry, escalating wrongly costs every retry thereafter.
+      _oomk=$(python "$CODE/jobs/tts_job_lib.py" oom-class --memguard-flag "$MG_FLAG" \
+                     --log "$PRED"/ERR/"$GOT"__*.txt 2>/dev/null | head -1)
+      case "$_oomk" in
+        gpu_size) esc=1 ;;
+        gpu_contention)
+          esc=0
+          echo "worker $WORKER_ID: $GOT hit a GPU OOM caused by CONTENTION, not size -- NOT forcing offload"
+          python "$CODE/jobs/tts_job_lib.py" oom-class --memguard-flag "$MG_FLAG" \
+                 --log "$PRED"/ERR/"$GOT"__*.txt 2>/dev/null | tail -1 ;;
+        ram) esc=0; echo "worker $WORKER_ID: $GOT hit a HOST-RAM OOM -- retry WITHOUT force-offload" ;;
+        *)   esc=0 ;;
+      esac
+      echo "worker $WORKER_ID INCOMPLETE $GOT (cif=$nc npz=$np)"; rm -rf "$CLAIMED/$GOT" "$SRC"; _fail "$GOT" "$esc"
+    fi
+  done
+  # WAIT FOR THE IN-FLIGHT SCORERS. They are backgrounded, so exiting here would kill whichever is
+  # still scoring the last target or two. The merge would then silently recompute those -- correct but
+  # slow, which is the outcome this whole path exists to avoid. Bounded, so a wedged scorer cannot
+  # hold the worker (and its GPU) open indefinitely.
+  _sw=0
+  while [ "$(jobs -rp | wc -l)" -gt 0 ] && [ "$_sw" -lt "${INFLIGHT_DRAIN_SEC:-1800}" ]; do
+    sleep 10; _sw=$((_sw + 10))
+  done
+  [ "$(jobs -rp | wc -l)" -gt 0 ] && \
+    echo "worker $WORKER_ID: $(jobs -rp | wc -l) scorer(s) still running after ${_sw}s, leaving them to the merge"
+  echo "worker $WORKER_ID exit $(date -u)"
+
+# ---- cluster wiring (fill in for your cluster; values below are PLACEHOLDERS) ----
+job_name: tts-b0b-pool
+
+resourcing:
+  cpu: 8                 # REQUEST 8 per 1 GPU, with the limit at 12 below. `requests` is a
+                         # scheduling RESERVATION, `limits` is the throughput cap. Inference bursts
+                         # to about 11 cores and the limit of 12 already covers that, so raising the
+                         # REQUEST buys no speed. It only reserves more of the queue flavour's
+                         # bundled CPU, which is bundled per GPU, so a bigger request consumes CPU
+                         # other users need to admit their own GPU jobs.
+  memory: 64Gi           # peak host RSS is 9.2 GiB at the worst case (1155 tokens, 50 samples,
+                         # confidence chunk 5, CPU-offload active), and host RAM is FLAT in sample
+                         # count once the confidence stage is chunked, so TOKEN count is what moves
+                         # it. This is ~7x that peak for a 1-GPU pod and ~1.7x for a 4-GPU one, one
+                         # inference per GPU. Above 128 samples the offload rail fires and the
+                         # retained-sample stack grows, so raise it for such a pool.
+  nvidia.com/gpu: 1      # ONE GPU per worker; parallelism = how many workers you submit
+
+# PIN THE GPU MODEL. Full note in tts-cast-pool.yaml.
+node_selector: '<YOUR-GPU-PRODUCT-LABEL>'    # e.g. nvidia.com/gpu.product: <A100-80GB product name>
+tolerations: []                              # add the taint your large-GPU nodes carry, if any
+
+namespace: '<YOUR-NAMESPACE>'
+image: '<YOUR-PROTENIX-IMAGE>'
+
+additional_volumes:
+  - name: work
+    mount_path: /workspace
+    claim_name: '<YOUR-PVC-CLAIM>'
+    read_only: False
+
+git_repo: null
+git_commit: null

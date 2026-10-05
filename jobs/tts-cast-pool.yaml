@@ -1,0 +1,1564 @@
+# CAST -- Cross-subsample Amortised Site Tilting. The joint-pool steering run.
+#
+# WHAT THIS RUNS. K MSA-subsample latents share ONE particle filter, tilted by a SITE-measurable
+# reward, with (umbrella x site) stratified resampling inside an early selection window. Every arm
+# loads experiments/configs/diffusion_side/m5_cast.yaml, which is where the method's defaults and its
+# five ABLATION KNOBs live -- read that file before changing anything here.
+#
+# WHY ITS OWN FILE AND NOT A FLAG ON tts-tds-pool.yaml. `subsample_pool` changes what a PARTICLE IS,
+# so the two templates disagree on the single most load-bearing number in the run: how many cifs a
+# healthy unit produces. Separate emits N_SEEDS*N_SAMPLES, joint emits N_SAMPLES + K - 1, because the
+# diffusion is DEFERRED to the K-th subsample and entries 1..K-1 are single-particle trunk
+# by-products. tts-tds-pool.yaml hardcodes the separate product in its health gate, which is correct
+# THERE and silently wrong for a joint run, where every unit counts 0 cifs against expectation, is
+# marked unhealthy and re-runs once. This file carries the joint arithmetic, that one keeps the
+# separate arithmetic. Neither has to know about the other.
+#
+# THE COST IDENTITY THIS TEMPLATE EXISTS TO EXPLOIT. Exploring K latents the separate way costs
+# K x N structures. CAST costs N + K - 1. Both are LINEAR in K -- with slopes N and 1, so the cost is
+# effectively constant in K over any usable range. Do NOT describe this as exponential-vs-linear.
+#
+# DEFAULTS ARE THE JOINT MODEL, unlike tts-tds-pool.yaml:
+#   SUBSAMPLE_POOL=4          K, the defining knob. Set K, never N_SEEDS -- N_SEEDS is DERIVED.
+#   WEIGHT_LEVEL_CORRECTION=true   required at K>1, auto-forced off at K<=1 by the spec.
+#   REWARD=epitope            MANDATORY at K>1, not a preference: the preflight
+#                             (tts_job_lib.py, "requires reward=epitope") refuses any other reward
+#                             for subsample_pool>1. site_contact at contact_weight=0.0 is
+#                             numerically the same pure site CV, but the guard tests the NAME. The
+#                             contact shell is opt-in and is NOT site-measurable, so turning it on
+#                             forfeits the pose-invariance argument the method rests on.
+#   CLIP=6 / CLIP_KNOB=guidance_max_rms_a   size-invariant rail, ~705 A at 4601 atoms.
+#
+# ONE TILTED RESAMPLE, NOT TWO. The shipped window admits 2 resample events,
+# but `potential=difference` sets r_prev=r_cur at the FIRST scoring event, so its spread is zero by
+# construction, lambda never calibrates there, and that event resamples on the proposal correction
+# ALONE -- which selects mildly AGAINST the particles guidance moved most. Only the second event
+# carries the reward. To get two genuinely tilted resamples at the SAME resample count, run
+# EXTRA_SET="method.diffusion_search.resample_windows=0.35:0.45".
+#
+# The claim/reclaim/dead-letter machinery, the health gate, the distortion gate and the concurrent
+# DockQ scoring are shared VERBATIM with jobs/tts-tds-pool.yaml. Keep the two in sync when that
+# machinery changes, in particular the `exit 0` before the cluster-wiring stanza, the scorer drain
+# and the deadline/requeue path.
+#
+# PARALLELISM = HOW MANY WORKERS YOU SUBMIT. Each worker job holds exactly ONE GPU and drains a
+# shared PVC queue of ARMS (atomic `mkdir` claim), so N workers give ~N-way parallelism and the run
+# finishes at ~total_arms/N with no straggler tail. Submit with jobs/submit_steer_pool.sh:
+#
+#   CODE=$PWD TEMPLATE=jobs/tts-cast-pool.yaml RUN_DIR=<run> \
+#     bash jobs/submit_steer_pool.sh --gpus 4 --local --env-file env.sh
+#
+#   The env file exports EPI_HYBK12, PROTENIX_CDR_MAP, GT_INDEX, INPUTS_WIRED and TARGETS; see the
+#   environment-file table in README.md. Add --dry-run to stop after the preflight.
+#
+# NO GROUND-TRUTH FILE IS NEEDED. With only EPI_HYBK12 set the queue is the hybk12 arm alone,
+# reading the deployable map. The matched control is opt-in (SKIP_CTRL=0) and reads no map at all,
+# being pure Best-of-N with the hook never installed. EPI_TRUE is required ONLY under WANT_GT=1,
+# which adds the oracle ceiling arms.
+#
+# ABLATION, one override each (see m5_cast.yaml for what turning each off costs):
+#   SUBSAMPLE_POOL=1                                   -> collapses CAST to the separate model
+#   EXTRA_SET="...guidance_scale=0"                    -> pool + SMC, tilt off
+#   EXTRA_SET="...site_hinge=false"                    -> plain harmonic, no arrival ball
+#   EXTRA_SET="...potential=sum"                       -> absolute reward instead of improvement
+#   UMBRELLA=11                                        -> collapse the umbrella axis
+#
+# BUILD THE DEPLOYABLE MAP FIRST, in three steps, from an UNSTEERED pool:
+#   token_maps.py epitope --scorer pool_modes --n-patches 3 --pool-dir <unsteered pool>
+#   token_maps.py tiles   --k-want 12
+#   token_maps.py hybrid                              -> EPI_HYBK12
+# `hybrid_modes_tiles` is the _builder stamp the preflight cross-checks, not a scorer name.
+# EPI_PRED3 / EPI_MODE3 / EPI_HYBENS remain supported for the comparison arms this template
+# inherited, but none of them is in the default queue.
+#
+# WHY A POOL RATHER THAN FIXED SHARDS. Steering arms have VERY uneven cost: an arm that tears
+# structures or saturates its clip can run far longer or shorter than its neighbours, and cost is not
+# predictable from the grid coordinates. A pool means a worker never idles while another finishes.
+#
+# WHY ONE ARM PER CLAIM. A worker claims a single (target, arm) unit, so a job killed mid-grid loses
+# at most one arm, and the deadline only has to cover ONE arm rather than a whole row. Size
+# DEADLINE_S to the scheduler's own maximum execution time and let UNIT_EST_S retire the worker
+# cleanly, rather than sizing the deadline down to one arm (see jobs/submit_steer_pool.sh).
+#
+# RESTART / RE-SUBMIT is safe. Claims are atomic and completed arms retire to done/, so a resubmitted
+# worker rejoins the pool, never double-runs an arm, and exits 0 immediately if the queue is drained.
+# Re-running the whole pool after a partial run only executes the arms still in pending/.
+#
+# NO CODE CHANGES: pure orchestration. It calls the same experiments.scripts.run_ablation and
+# $CODE/jobs/tts_job_lib.py that every other job uses.
+#
+# CLUSTER-AGNOSTIC: everything cluster-specific is an env var or a <PLACEHOLDER> below.
+
+command_script: |
+  set -uo pipefail
+
+  # ---- code (adapt or replace with your own checkout/mount) ----
+  CODE="${CODE:-$PWD}"                            # dir containing the Protein-TTS package
+  cd "$CODE"
+
+  # ---- job parameters ----
+  METHOD="${METHOD:-cast}"                        # label only; this template runs ONE algorithm
+  RUN_DIR="${RUN_DIR:-./runs/steer_${METHOD}}"    # shared output root (all workers + the queue)
+  INPUTS_WIRED="${INPUTS_WIRED:-./runs/inputs_wired}"   # MSA-wired input jsons
+  TARGETS="${TARGETS:-9atr_nb2}"                  # space-separated target ids
+  N_SEEDS="${N_SEEDS:-4}"                         # MSA subsamples per arm; DERIVED from
+                                                  # SUBSAMPLE_POOL below -- set K, not this
+  # N=720 IS THE OPERATING POINT, not the 780 ceiling and not the template's inherited 50.
+  # It lands the grid exactly: 60 cells x 12, giving [180,180,180,180] at K=4. Do not raise this
+  # above 780 (project ceiling) and do not pair it with K=5, which leaves 2 per latent per cell.
+  N_SAMPLES="${N_SAMPLES:-720}"                   # particles in the SHARED pool (not per latent)
+  SEED0="${SEED0:-101}"                           # first inference seed
+  WORKER_ID="${WORKER_ID:-0}"
+  N_WORKERS="${N_WORKERS:-1}"
+  MAX_ATTEMPTS="${MAX_ATTEMPTS:-2}"               # dead-letter an arm after this many claims
+  # DockQ needs numpy<2, the sampler needs numpy>=2, so scoring runs under its own interpreter.
+  SCORE_PY="${SCORE_PY:-${TTS_ROOT:-/data/tts}/venv_score/bin/python}"
+  SCORE_DOCKQ="${SCORE_DOCKQ:-${TTS_ROOT:-/data/tts}/venv_score/bin/DockQ}"
+
+  # ---- WHICH CO-FOLDING MODEL. The same contract in every pool template. ----
+  # Defaults reproduce history exactly. To run the same arms on the second model:
+  #   BACKEND=opendde TTS_CFG_SUFFIX=_opendde OPENDDE_ROOT_DIR=<tree> OPENDDE_BIN=<tree>/.venv/bin/opendde
+  # TTS_CFG_SUFFIX is applied to whatever config this template selects, so m2_tds.yaml becomes
+  # m2_tds_opendde.yaml. A suffix naming a config that does NOT exist is a hard failure, never a
+  # silent fall back to the Protenix file: an arm quietly running the other model is indistinguishable
+  # from the rest of the pool in the results, which is the one failure mode worth an abort.
+  BACKEND="${BACKEND:-protenix2}"
+  SCORE_BACKEND="${SCORE_BACKEND:-$BACKEND}"      # the results reader must follow the model
+  # VALIDATE THE NAME, because $BACKEND is interpolated into config keys (model.$BACKEND.*) and
+  # run_ablation ACCEPTS an unknown key silently: `--set model.bogusbackend.deterministic=true`
+  # parses fine and runs on to the input stage. So a typo would not error, it would quietly drop
+  # determinism AND skip the opendde block below. One list, checked once, is what keeps the
+  # interpolation honest.
+  case "$BACKEND" in
+    protenix2|opendde) ;;
+    *) echo "!! BACKEND=$BACKEND is not a known backend (protenix2|opendde)"; exit 2 ;;
+  esac
+  TTS_CFG_SUFFIX="${TTS_CFG_SUFFIX:-}"
+  DET_SET="model.${BACKEND}.deterministic=true"   # the key is namespaced per backend
+  if [ "$BACKEND" = "opendde" ]; then
+    # OpenDDE ships in its OWN venv, so the backend shells out to that console script. Both vars are
+    # REQUIRED: an unset OPENDDE_BIN makes the backend derive a bare `python`, which cannot import
+    # runner.cli and fails every unit AFTER the job is admitted and holds a GPU.
+    export OPENDDE_ROOT_DIR="${OPENDDE_ROOT_DIR:?set OPENDDE_ROOT_DIR (holds the abag checkpoint)}"
+    export OPENDDE_BIN="${OPENDDE_BIN:?set OPENDDE_BIN to the opendde console script inside its venv}"
+    [ -x "$OPENDDE_BIN" ] || { echo "OPENDDE_BIN=$OPENDDE_BIN is not executable"; exit 2; }
+  fi
+  cfg_for_backend () {
+    [ -z "$TTS_CFG_SUFFIX" ] && { echo "$1"; return 0; }
+    local _c="${1%.yaml}${TTS_CFG_SUFFIX}.yaml"
+    [ -f "$_c" ] || { echo "!! no $BACKEND config for this arm: $_c (from $1)" >&2; return 1; }
+    echo "$_c"
+  }
+  # GT_INDEX MUST EXIST BEFORE A GPU IS TAKEN. Pointed at a path that does not exist,
+  # `evaluate --from-per-sample` dies with FileNotFoundError, the worker logs "!! scoring failed",
+  # and the unit is still retired as DONE, because the health gate counts cifs and not metrics. The
+  # run then reads done=N failed=0 with every dockq column all-NaN, which is a full night of GPU
+  # time that looks healthy and produced no result.
+  # Fail HERE, in one second, rather than after the last unit.
+  GT_INDEX="${GT_INDEX:-${TTS_ROOT:-/data/tts}/runs/collected_bad_cases/target_index.csv}"
+  if [ "${SCORE_JOBS:-1}" -gt 0 ] && [ ! -f "$GT_INDEX" ]; then
+    echo "!! GT_INDEX does not exist: $GT_INDEX" >&2
+    echo "!! Scoring would fail on EVERY unit and each would still be retired as done." >&2
+    echo "!! Point GT_INDEX at a target_index.csv, or set SCORE_JOBS=0 to score externally." >&2
+    exit 2
+  fi
+  SCORE_JOBS="${SCORE_JOBS:-3}"                  # max concurrent background scorers per worker
+
+  # Grid axes, FIXED at the calibrated point -- this template deliberately does NOT sweep. The axis
+  # here is the epitope SOURCE, so every other knob is pinned.
+  # REWARD=epitope IS MANDATORY AT K>1, not a preference: tts_job_lib.py:452 rejects any other
+  # reward for subsample_pool>1, because mixed conditioning is only sound while the tilt is
+  # measurable w.r.t. the SITE alone. site_contact at contact_weight=0 is numerically identical to
+  # this, but the guard tests the NAME, so epitope is the legal spelling.
+  ALGO=cast; REWARD=epitope; UNITS=centroid_A
+  UMBRELLA="${UMBRELLA:-9,11,13,15}"   # 4 umbrellas, spanning the native paratope-epitope
+                                       # separations over the target set
+  SCALE="${SCALE:-75}"                 # the failure mode above 75 is tearing, not saturation
+  CLIP="${CLIP:-6}"                    # AUTO CLIP 6 (per-atom RMS), the size-invariant
+                                       # equivalent of the absolute 700 it replaces
+  # SHARED KNOBS, names and defaults matching jobs/tts-steer-pool.yaml so the two templates cannot
+  # drift again. CLIP_KNOB selects WHICH clip the CLIP value drives: guidance_max_rms_a is the
+  # size-invariant rail (Angstrom per degree of freedom) and is what the production template now
+  # defaults to, guidance_max_norm is the old absolute cap. An absolute cap cannot mean the same
+  # thing across targets, so a value tuned on one target is not the value for another.
+  # NOTE the two knobs need DIFFERENT magnitudes, and the conversion is TARGET-DEPENDENT:
+  #     max_norm  =  max_rms_a * sqrt(n_atoms * 3)        (guidance.py:590)
+  # so there is no universal constant. On a 4601-atom complex sqrt(n*3) = 117.5, hence
+  #     rms 3 -> 352,   rms 6 -> 705,   rms 12 -> 1410
+  # so the absolute 700 corresponds to rms ~6 at this size, NOT rms 12: an rms-12 arm is given
+  # DOUBLE the displacement budget rather than an equivalent one, and never saturates where the
+  # norm-700 arm saturates on most logged steps. For a like-for-like swap of rails at this size use
+  # CLIP=6. CLIP must be set together with CLIP_KNOB, never one alone.
+  CLIP_KNOB="${CLIP_KNOB:-guidance_max_rms_a}"   # SIZE-INVARIANT by default. An absolute cap means
+                                                 # a different per-atom budget on every target.
+  # BOTH KEYS, UNUSED ONE ZEROED. guided_step gives guidance_max_rms_a absolute precedence when it
+  # is > 0, so a template that emitted only the absolute cap would run at the config's rms_a and
+  # $CLIP would do nothing at all, with the clip axis inert and no warning anywhere. Emit the pair
+  # so $CLIP_KNOB is honoured whichever way it points.
+  if [ "$CLIP_KNOB" = "guidance_max_rms_a" ]; then
+    CLIP_SET="method.diffusion_search.guidance_max_rms_a=${CLIP}.0 method.diffusion_search.guidance_max_norm=0"
+  else
+    CLIP_SET="method.diffusion_search.guidance_max_norm=${CLIP}.0 method.diffusion_search.guidance_max_rms_a=0"
+  fi
+  # ESCAPE HATCH for one-off overrides that do not deserve their own env var. Appended LAST so it
+  # wins over anything in $COMMON, which is what makes it usable for exactly the case it exists for:
+  # flipping a single spec field in an A/B without editing the template or the shared config. Empty
+  # by default, so every existing arm is byte-identical. Space-separated `key=value` pairs in the
+  # `method.diffusion_search.<field>=<value>` form the runner already takes.
+  EXTRA_SET="${EXTRA_SET:-}"
+  SITE_HINGE="${SITE_HINGE:-true}"
+  SITE_HUBER="${SITE_HUBER:-${HUBER:-4.0}}"      # keeps the legacy $HUBER spelling working
+  # CROSS-SUBSAMPLE JOINT POOL, same knob and same gate as tts-steer-pool.yaml. K = 1 is the SEPARATE
+  # model: each MSA subsample gets its own trunk pass and its own diffusion, and no filter can ever
+  # compare them. K > 1 is the JOINT model: one N-particle diffusion over all K conditionings, which
+  # is the only arrangement in which a particle filter can move weight between subsamples.
+  # K MUST EQUAL N_SEEDS. The hook defers the diffusion until the K-th subsample arrives, so a K
+  # larger than the number of subsamples actually built means the real diffusion NEVER fires and the
+  # run emits only one-particle placeholders -- a silent near-empty pool, not an error.
+  SUBSAMPLE_POOL="${SUBSAMPLE_POOL:-4}"           # JOINT model: K latents share ONE filter. This is
+                                                  # its own algorithm now: configs/diffusion_side/m5_cast.yaml
+  # DERIVE n_seeds FROM THE POOL SIZE rather than refusing to run. The diffusion is deferred until
+  # the K-th subsample arrives, so a mismatch never fires it -- silently, since the run still emits
+  # one-particle placeholders and logs normally. Exiting on the mismatch caught it, but every caller
+  # then had to set the same number twice; deriving it removes the class of mistake.
+  if [ "$SUBSAMPLE_POOL" -gt 1 ] && [ "$SUBSAMPLE_POOL" -ne "$N_SEEDS" ]; then
+    echo "[joint] N_SEEDS=$N_SEEDS -> $SUBSAMPLE_POOL to match SUBSAMPLE_POOL (they must agree)"
+    N_SEEDS="$SUBSAMPLE_POOL"
+  fi
+  # THE lambda*r_0 LEVEL TERM, opt-in and OFF by default, same spelling as tts-steer-pool.yaml. With
+  # potential=difference the accumulated log weight telescopes to lambda*(r_T - r_0), adding
+  # lambda*r_0 once restores lambda*r_T.
+  # NO SUBSAMPLE_POOL GATE. The r_0 level does NOT cancel at K=1: `_r_first` is
+  # `np.asarray(r_cur).copy()`, a (P,) vector with one reward PER PARTICLE, and only a SCALAR
+  # cancels in a softmax, so K=1 is a legitimate configuration here.
+  # EXPECT IT TO LOWER ESS, NOT RAISE IT: the first scoring event has r_prev == r_cur by
+  # construction, so the correction contributes only the spread of r_0 there.
+  WEIGHT_LEVEL_CORRECTION="${WEIGHT_LEVEL_CORRECTION:-true}"   # REQUIRED at K>1; auto-forced off at K<=1
+  # The epitope maps. Every arm differs ONLY in which of these the hook reads.
+  # ORACLE OPT-IN, decided here because it governs whether a GROUND-TRUTH FILE IS NEEDED AT ALL.
+  # tts-tds-pool.yaml demands EPI_TRUE unconditionally, which is right there (its gt arms always
+  # run) and wrong here: CAST's default queue is the deployable hybk12 arm, plus the control when
+  # SKIP_CTRL=0, and neither reads an oracle map, so requiring one would make a deliberately
+  # ground-truth-free run impossible to launch.
+  WANT_GT="${WANT_GT:-0}"
+  if [ "$WANT_GT" = "1" ]; then
+    EPI_TRUE="${EPI_TRUE:?WANT_GT=1 needs EPI_TRUE (the ground-truth epitope tokenmap)}"
+  else
+    EPI_TRUE="${EPI_TRUE:-}"
+  fi
+  # DiscoTope, spatially clustered into candidate patches. OPT-IN: it is the WEAKER of the two
+  # deployable maps (25/52 targets within one 12 A footprint) and is kept only as a comparison.
+  EPI_PRED3="${EPI_PRED3:-}"
+  # POOL-MODE map: the UNSTEERED pool's own binding-site modes as candidate patches
+  # (token_maps.py epitope --scorer pool_modes). THE DEFAULT DEPLOYABLE MAP -- antibody-conditioned
+  # by construction, with no external predictor and no training. Deeper sampling of the same pool
+  # does NOT improve it, so the remaining limit is trunk and MSA-seed diversity, not diffusion
+  # depth.
+  EPI_MODE3="${EPI_MODE3:-}"
+  EPI_GT="${EPI_GT:-}"                          # switch for the ground-truth arm block
+  # HYBRID map, ENSEMBLE tiling. Pool modes (top 3)
+  # first, then surface tiles built on the POOL-MEAN geometry rather than on whichever single
+  # conformer sorted first, filling a fixed 15-candidate budget. Stamps
+  # `_builder: hybrid_modes_ensemble_tiles`, which is what the preflight below cross-checks.
+  # Against the single-conformer tiling it gives up a little reach at 6 A in exchange for
+  # stability: rebuilt from disjoint subsets of the same pool, its tilings agree far more closely
+  # and its per-target best candidate barely moves. Build with
+  #   token_maps.py epitope --scorer pool_modes --n-patches 3 ...
+  #   token_maps.py tiles-ensemble --fill-to 15 --modes-json <modes> ...
+  #   token_maps.py hybrid --modes-json <modes> --tiles-json <tiles> ...
+  # Unset = no hybens arm, same opt-in shape as every other map here.
+  EPI_HYBENS="${EPI_HYBENS:-}"
+  # NON-ENSEMBLE HYBRID (`hybrid_modes_tiles`, tiling provenance `surface_tiles`).
+  # ** THIS IS THE PREFERRED MAP. ** In AGGREGATE it and the ensemble build are close, but the 6 A
+  # band is what survives downstream and the per-target spread between them is large. On a target
+  # where they disagree, swapping the map at a FIXED schedule moves max dockq_abag far more than
+  # the resampling schedule or the clip rail does, because only the structures that reach within
+  # 6 A of the true epitope score at all.
+  #
+  # THE ENSEMBLE BUILD IS STILL THE RIGHT CHOICE WHEN THE MAP MUST BE REBUILT: this tiling depends on
+  # which pool filename sorts first, so it is reproducible only while the pool directory is FROZEN.
+  # Ship the built map file with a checksum. A 15-candidate budget cannot do better: several ways
+  # of selecting 15 from the union of both maps all score BELOW this map's own 15.
+  EPI_HYBK12="${EPI_HYBK12:-}"
+  # EPI_TRUE IS GUARDED LIKE ITS SIBLINGS, not bare. It was the one entry expanded unconditionally,
+  # which was harmless while it was a required variable and became a launch failure the moment it
+  # stopped being one: an unset EPI_TRUE contributes an EMPTY element, and `[ -f "" ]` fails with
+  # "!! epitope map not found: " naming nothing at all.
+  for _m in ${EPI_TRUE:+"$EPI_TRUE"} ${EPI_PRED3:+"$EPI_PRED3"} ${EPI_MODE3:+"$EPI_MODE3"} \
+            ${EPI_HYBENS:+"$EPI_HYBENS"} \
+            ${EPI_HYBK12:+"$EPI_HYBK12"}; do
+    [ -f "$_m" ] || { echo "!! epitope map not found: $_m"; exit 2; }
+  done
+
+  Q="$RUN_DIR/queue"; PENDING="$Q/pending"; CLAIMED="$Q/claimed"; DONE="$Q/done"; FAILED="$Q/failed"
+  HB="$Q/heartbeat"; FORCE="$Q/force_offload"; OOMLOG="$RUN_DIR/oom_events.jsonl"
+  mkdir -p "$RUN_DIR" "$PENDING" "$CLAIMED" "$DONE" "$FAILED" "$HB" "$FORCE"
+  # LOG NAME MUST BE UNIQUE PER POD, NOT PER WORKER_ID. WORKER_ID is only a label and every job in
+  # a wave routinely carries the same value, so `worker_${WORKER_ID}.log` collects every worker's
+  # startup in one file. Concurrent writers interleave, and a block then lands under another
+  # worker's banner, which reports one unit's health under the WRONG arm. $HOSTNAME is the pod name,
+  # so it is unique per worker even when WORKER_ID is not.
+  LOG="$RUN_DIR/worker_${WORKER_ID}_${HOSTNAME:-$$}.log"; exec > >(tee -a "$LOG") 2>&1
+  # ...and the per-unit run.log written by run_unit stays the AUTHORITY for what an arm did.
+  # Never attribute a health line from the worker log to a unit, read $RUN_DIR/<unit>/run.log.
+  echo "===== steering pool: METHOD=$METHOD worker $WORKER_ID/$N_WORKERS $(date -u) ====="
+  nvidia-smi -L || true
+  # ---- REFUSE TO START ON AN OCCUPIED CARD ----
+  # Two workers on a multi-GPU pod that both default to CUDA_VISIBLE_DEVICES=0 leave the other card
+  # idle and die on a contention OOM, which the classifier below then reads as a SIZE failure and
+  # answers with forced confidence-offload, a fix for a problem the unit never had. This costs one
+  # nvidia-smi call and turns that whole chain into one line at startup. A worker that shares a card
+  # ON PURPOSE raises GPU_BUSY_GIB.
+  # READ THE ROW BY INDEX, NOT `head -1`. nvidia-smi IGNORES $CUDA_VISIBLE_DEVICES and always
+  # enumerates every device, so `head -1` reports physical GPU 0 whatever this worker was given --
+  # wrong in both directions on exactly the multi-GPU pod the check exists for.
+  #
+  # ONE CONDITION: is a specific integer device assigned? Unset (the dry-run convention) or a UUID
+  # means there is nothing to attribute, so the check is skipped. It must NOT test $DRY_RUN as well
+  # -- a composite key such as "${DRY_RUN:-0}:${_gpu_idx:-}" always contains a COLON, which matches
+  # `*[!0-9]*`, so the guard would take the "not an index" branch and FAIL OPEN on a busy card.
+  # Keeping DRY_RUN out of it also means `DRY_RUN=1 CUDA_VISIBLE_DEVICES=0` exercises the refusal
+  # and still stops before any GPU work.
+  # ${VAR%%,*} on an UNSET variable is an error under `set -u`, and CUDA_VISIBLE_DEVICES is
+  # exactly the variable a scheduler-submitted worker does NOT have: the device is assigned by the
+  # runtime, not by the env, so the worker dies with "CUDA_VISIBLE_DEVICES: unbound variable" before
+  # it reaches any other check. Default it FIRST, then strip.
+  _gpu_idx="${CUDA_VISIBLE_DEVICES:-}"; _gpu_idx="${_gpu_idx%%,*}"
+  case "${_gpu_idx:-}" in
+    "")       echo "[startup] occupied-card check skipped (no CUDA_VISIBLE_DEVICES)" ;;
+    *[!0-9]*) echo "[startup] occupied-card check skipped ($_gpu_idx is not a device index)" ;;
+    *)
+      _busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+              | awk -F', *' -v i="$_gpu_idx" '$1 == i {print $2}')
+      if [ -n "${_busy:-}" ] && [ "$_busy" -gt "$(( ${GPU_BUSY_GIB:-8} * 1024 ))" ]; then
+        echo "!! GPU $_gpu_idx already holds ${_busy} MiB, over the ${GPU_BUSY_GIB:-8} GiB start bar."
+        echo "!! On a multi-GPU pod EVERY worker needs its OWN device. Two workers on one card is"
+        echo "!! how a unit is lost to a fake size-OOM. Give this worker a free index, or raise"
+        echo "!! GPU_BUSY_GIB to share on purpose."
+        exit 5
+      fi
+      echo "[startup] GPU $_gpu_idx holds ${_busy:-0} MiB before this worker starts" ;;
+  esac
+  echo "CODE TREE: $CODE"
+
+  . "${VENV:-/opt/venv}/bin/activate" 2>/dev/null || true
+  export PYTHONPATH="$CODE"
+  export PROTEIN_TTS_DATASET="${PROTEIN_TTS_DATASET:-collected_bad_cases}"
+  # Ground truth MUST resolve or DockQ/CA-RMSD are written as NaN with no error at all.
+  export FOLDBENCH_ROOT="${FOLDBENCH_ROOT:?set FOLDBENCH_ROOT; <ROOT>/ground_truths must exist}"
+  export PROTENIX_CDR_MAP="${PROTENIX_CDR_MAP:?set PROTENIX_CDR_MAP}"
+  # THE CHECKPOINT ROOT IS REQUIRED TOO. `resolve_model_source` takes `private_root` from
+  # $PROTENIX_ROOT_DIR, and `_private_checkpoint_present(None)` is False, so a submission that
+  # forgot it does not fail. It falls through to the PUBLIC branch and downloads weights, while
+  # every arm it is meant to be compared against loaded the checkpoint already on the volume. Same
+  # architecture, so nothing looks wrong: the log line is the only difference. Every arm in a
+  # comparison must resolve its weights the same way, so this is a launch-time error, not a default.
+  # PROTENIX-ONLY, and gated so it is. This is the PROTENIX checkpoint cache, not one of the token
+  # maps (PROTENIX_CDR_MAP and PROTENIX_EPITOPE_MAP carry the prefix but are read by the shared hook
+  # on BOTH backends, so those stay required either way). Ungated, this ${VAR:?} aborts every
+  # OpenDDE run of this template before it reaches a GPU, demanding a cache the run never opens. OpenDDE has its own OPENDDE_ROOT_DIR, checked in the block above.
+  if [ "$BACKEND" = "protenix2" ]; then
+    export PROTENIX_ROOT_DIR="${PROTENIX_ROOT_DIR:?set PROTENIX_ROOT_DIR (the checkpoint cache); without it the run silently takes the PUBLIC branch}"
+  fi
+  # A site file, if there is one, supplies the registry facts this repo deliberately does not hold.
+  # ---- CHECKPOINT ROUTE: PRIVATE FIRST, PUBLIC FALLBACK, AND SAY WHICH ONE BEFORE THE GPU STARTS ----
+  # The resolution logic lives in ONE place, `tts_job_lib.py checkpoint-route`, which calls the same
+  # models/protenix_provision.resolve_model_source the run itself calls. Inlining a copy per template
+  # would be a SECOND definition of the route, free to disagree with the run it is supposed to
+  # precede, and there are 21 job scripts here for it to disagree with.
+  #
+  # THERE IS NO DOWNLOAD BRANCH. The only route to a "private" label is a checkpoint already sitting
+  # at the root, baked into the image or placed there by hand. Everything else resolves to public.
+  #
+  # A DEFINED CACHE FOR THE FALLBACK. Unset means "the package default", which is a different
+  # directory per image and so cannot be pre-seeded or checked. Defaults to the private root so that one
+  # cache serves both branches, which is also why checkpoint-route warns when the two coincide.
+  # Gated with PROTENIX_ROOT_DIR above, and it MUST be: this body runs under `set -u`, so once that
+  # variable is only set for Protenix, an ungated ${...:-$PROTENIX_ROOT_DIR} here aborts every
+  # OpenDDE run with "PROTENIX_ROOT_DIR: unbound variable" instead of falling back.
+  if [ "$BACKEND" = "protenix2" ]; then
+    export PROTENIX_PUBLIC_ROOT_DIR="${PROTENIX_PUBLIC_ROOT_DIR:-$PROTENIX_ROOT_DIR}"
+  fi
+  # Report the route NOW, not from a run log 20 minutes in. Every arm in a comparison must resolve
+  # its weights the same way, and the cheapest place to catch a mismatch is before the first claim.
+  # GATED ON $BACKEND: this resolves PROTENIX weights. Ungated it also ran on OpenDDE
+  # units and announced a protenix-v2 cache at the top of a run that never builds a
+  # Protenix model. Inert, but the first line a reader sees was about the wrong model.
+  if [ "$BACKEND" = "protenix2" ]; then
+    python "$STATS_DIR/tts_job_lib.py" checkpoint-route || { echo "!! checkpoint route unresolved"; exit 6; }
+  else
+    _ck="$OPENDDE_ROOT_DIR/checkpoint/opendde_abag.pt"
+    if [ -f "$_ck" ]; then echo "[route] backend=opendde checkpoint=$_ck (antibody-antigen)"
+    else echo "[route] backend=opendde checkpoint=MISSING at $_ck -> --model_name opendde_v1 (general)"; fi
+  fi
+
+  # NO LAYER-NORM PROBE HERE, deliberately. This template already exports LAYERNORM_TYPE=torch
+  # unconditionally further down, so every run of it has always taken the torch path and never
+  # compiles the fused extension. A probe above that export
+  # would be dead code AND would print "not bit-identical to the reference runs", which is false
+  # here, because torch IS what the reference runs use. jobs/tts-b0b-pool.yaml sets no such export,
+  # so the probe lives there.
+  # NOT required globally in this template: the epitope map is chosen PER ARM (arm_epitope_map),
+  # because the arms differ in exactly that. A global default is kept only so any code that reads
+  # it before the first arm starts sees a valid file.
+  export CUBLAS_WORKSPACE_CONFIG=:4096:8 LAYERNORM_TYPE=torch
+  # AUTO CONFIDENCE-OFFLOAD. Without this the resolver sees an unset variable and returns None, so
+  # should_offload is NEVER consulted and a target above the card's on-GPU token ceiling (800 on a
+  # 40 GB card) OOMs on its FIRST attempt, in run_confidence_head. Every tts-b0b* template exports
+  # this too.
+  export PROTENIX_CONF_OFFLOAD_TOKENS="${PROTENIX_CONF_OFFLOAD_TOKENS:-auto}"
+  # TOKEN-AXIS CHUNK, sized PER RUN from the targets' token counts. The upstream default is 256,
+  # which is fine for small targets and lethal for large ones: the triangle-attention logits in the
+  # trunk AND confidence head are [chunk, 16, N_token, N_token] bf16 = chunk*32*N_token^2 bytes, so
+  # at 256 they are 9.15 GiB at 1095 tokens and 10.18 at 1155 -- against 9.06 / 10.15 GiB free on a
+  # 40 GB card, so the largest targets die at ~97% completion, AFTER a fully successful diffusion.
+  # `auto` picks 256 below ~691 tokens, 128 to ~857, 64 to ~1200 -- so ONLY the large targets pay,
+  # and it reproduces the 64 chosen by hand for both failures. NOTE this is a THIRD knob: neither
+  # sample-axis chunk (PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE, PROTENIX_CONF_SAMPLE_CHUNK) touches
+  # this tensor -- right stage, wrong axis.
+  export PROTENIX_INFER_CHUNK_SIZE="${PROTENIX_INFER_CHUNK_SIZE:-auto}"
+
+  # TRUE-epitope map for the per-sample RIGHT-SITE column (`site_dist_a`). Unset = the column is
+  # simply null, the scorer never fails on it.
+  export PROTENIX_TRUE_EPITOPE="${PROTENIX_TRUE_EPITOPE:-}"
+  # PARITY WITH tts-b0b-pool.yaml (the only pool template proven in production). Every line below was
+  # MISSING from the steering templates, which is why large targets OOM'd: without the chunk default
+  # Protenix falls back to its own chunk of 5 (10-20x more sequential passes than auto would pick),
+  # and without the card ceilings + OOM-skip a single big target can burn a whole worker.
+  export PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE="${PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE:-auto}"
+  # 750 rather than 800: a target just under the rail is kept ON-GPU and CUDA-OOMs, while targets
+  # above the rail offload and complete cleanly. The memory model is optimistic by 5-7 GiB near the
+  # top of a 40 GB card, and 750 moves the 750-800 band to the safe side. It costs a little
+  # throughput, since offload is a fitting tool and not a speedup.
+  export PROTENIX_MAX_ONGPU_TOKENS_40G="${PROTENIX_MAX_ONGPU_TOKENS_40G:-750}"   # ceiling on a 40GB card
+  export PROTENIX_MAX_ONGPU_TOKENS_80G="${PROTENIX_MAX_ONGPU_TOKENS_80G:-950}"   # ceiling on an 80GB card
+  export PROTENIX_OOM_SKIP="${PROTENIX_OOM_SKIP:-1}"                # GPU OOM: skip the target's remaining seeds
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+  # ---- helper scripts must EXIST before any GPU work. They are called per-arm to score the pool,
+  #      and a missing one fails SILENTLY: the arm runs, writes its structures, retires to done/ and
+  #      never emits a row. Fail loudly here instead.
+  STATS_DIR="${STATS_DIR:-$CODE/jobs}"
+
+  # ---------------- ONE DATASET, checked BEFORE a GPU is taken ----------------
+  # Eight variables select the dataset (FOLDBENCH_ROOT, INPUTS_WIRED, GT_INDEX, PROTENIX_CDR_MAP,
+  # PROTENIX_TRUE_EPITOPE, EPI_HYBK12, EPI_TRUE, EPI_SHUF) and every one of them carries a default
+  # pointing at the collected bad cases. Overriding seven of the eight is a normal accident, and the
+  # result is a run whose structures are scored against another dataset's references while every
+  # existing gate passes, because those gates test EXISTENCE and the thing that differs is
+  # MEMBERSHIP. This checks membership: every artefact must cover every target in $TARGETS.
+  python "$STATS_DIR/tts_job_lib.py" dataset-check --targets "$TARGETS" \
+    --inputs-wired "$INPUTS_WIRED" --gt-index "$GT_INDEX" --foldbench-root "$FOLDBENCH_ROOT" \
+    ${PROTENIX_CDR_MAP:+--map "PROTENIX_CDR_MAP=$PROTENIX_CDR_MAP"} \
+    ${EPI_HYBK12:+--map "EPI_HYBK12=$EPI_HYBK12"} \
+    ${EPI_TRUE:+--map "EPI_TRUE=$EPI_TRUE"} \
+    ${EPI_SHUF:+--map "EPI_SHUF=$EPI_SHUF"} \
+    ${PROTENIX_TRUE_EPITOPE:+--map "PROTENIX_TRUE_EPITOPE=$PROTENIX_TRUE_EPITOPE"} \
+    || { echo "!! dataset-check failed: the run would mix datasets. Fix the paths above."; exit 2; }
+  MISSING=""
+  # Only tts_job_lib.py is guarded, because nothing external is required: the pool readouts are its
+  # `pool-stats` subcommand (div_conf / div_site / div_jac) and the oracle distance is `epi-dist`.
+  # It fails LOUDLY rather than letting an arm emit no rows.
+  for _f in tts_job_lib.py; do
+    [ -f "$STATS_DIR/$_f" ] || MISSING="$MISSING $_f"
+  done
+  if [ -n "$MISSING" ]; then
+    echo "!! missing helper script(s) in $STATS_DIR:$MISSING"
+    echo "!! scoring would fail silently and the grid would produce no rows -- aborting"
+    exit 3
+  fi
+  echo "[startup] helper scripts present in $STATS_DIR"
+
+  # WHICH EPITOPE MAP THIS ARM SEES. The hook reads $PROTENIX_EPITOPE_MAP, and preflight cross-checks
+  # it against method.diffusion_search.epitope_source, so the two MUST be set together or the arm is
+  # rejected. Setting it per-arm here is what makes the arms differ in exactly one thing.
+  arm_epitope_map () {
+    case "$1" in
+      gt|gthinge|gtgate|gtgate75|gtu*|gtcap|gtcapgate|gtc10|gtc30|gtc50|gtc70|gtc100|gtc*k*|gtc*sat*|gtc30f*|gtu*s100|gtc30u*s100|gtu12d*) echo "$EPI_TRUE" ;;
+      pred3) echo "$EPI_PRED3" ;;
+      mode3|m3soft|m3cap*|m3softcap|mode3res*) echo "$EPI_MODE3" ;;
+      hybens|hybens*) echo "$EPI_HYBENS" ;;
+      hybk12|hybk12*) echo "$EPI_HYBK12" ;;
+      # NOTE the mix of EXACT names and globs: m3sc30 is exact, so an arm that merely STARTS with it
+      # (m3sc30u12, the 12-umbrella contact arm) does NOT match and is rejected by the catch-all
+      # below. That is the guard working, not a bug, but it means every umbrella/floor variant needs
+      # its own entry. m3sc30u* covers the umbrella-count variants of the contact operating point.
+      # THE CONTROL READS NO MAP -- it is pure Best-of-N, the hook is never installed, and nothing
+      # in that path opens PROTENIX_EPITOPE_MAP. Handing it $EPI_TRUE ("unused but must be valid")
+      # would make the GROUND TRUTH a launch requirement for a queue that runs no oracle arm. The
+      # deployable map is used instead: equally unread, and already required by the hybk12 arm, so
+      # a CAST run needs no ground-truth file anywhere.
+      ctrl) echo "$EPI_HYBK12" ;;
+      # EVERY arm is named explicitly. The old catch-all silently handed an unlisted arm the GROUND
+      # TRUTH map, so a new deployable arm would have run as an oracle arm and reported a real-looking
+      # number. Failing here costs one preflight, the silent version costs a whole run.
+      *) echo "!! arm_epitope_map has no entry for arm '$1' -- add one" >&2; return 1 ;;
+    esac
+  }
+
+  # WHICH PREDICTOR BUILT THAT MAP. `epitope_source` only separates oracle from deployable, so
+  # pred3 (DiscoTope-3) and mode3 (the pool's own binding modes) both record as `predicted` and
+  # become indistinguishable in the spec, the label and the results -- and telling those two apart
+  # IS this experiment. The map files carry a `_builder` stamp, declaring it here gives the preflight
+  # an INDEPENDENT statement to compare against, so swapping EPI_MODE3 and EPI_PRED3 by mistake is
+  # caught instead of silently reported as the other arm. Same explicit-entry rule as
+  # arm_epitope_map: no catch-all, because a catch-all is how the oracle map leaked once already.
+  # Empty means "no check" and is correct for the ground-truth arms, which _source already pins.
+  arm_epitope_builder () {
+    case "$1" in
+      gt|gthinge|gtgate|gtgate75|gtu*|gtcap|gtcapgate|gtc10|gtc30|gtc50|gtc70|gtc100|gtc*k*|gtc*sat*|gtc30f*|gtu*s100|gtc30u*s100|gtu12d*) echo "" ;;
+      ctrl) echo "" ;;                   # does not steer; map unused
+      pred3) echo "discotope3" ;;
+      mode3|m3soft|m3cap*|m3softcap|mode3res*) echo "pool_modes" ;;
+      hybens|hybens*) echo "hybrid_modes_ensemble_tiles" ;;
+      hybk12|hybk12*) echo "hybrid_modes_tiles" ;;
+      *) echo "!! arm_epitope_builder has no entry for arm '$1' -- add one" >&2; return 1 ;;
+    esac
+  }
+
+  # ---- build the arm list (ONE list drives the preflight gate AND the run loop, so a gate pass is
+  #      a statement about the arms that actually run) ----
+  # GAPPED RESAMPLE WINDOWS, same knob as tts-steer-pool.yaml so a schedule that resamples early
+  # and again late with a gap between is expressible here too. Semicolon-separated pairs, e.g.
+  # "0.25:0.35;0.60:0.80".
+  # early2 IS THE DEFAULT WINDOW, matching tts-steer-pool.yaml and the m2/m3
+  # configs. Safe as a blanket default HERE, unlike in tts-steer-pool.yaml: that template carves out
+  # tds_sched because its arms own their windows through resample_start/end_frac, and a global
+  # window REPLACES those. No arm in THIS template sets either frac (m3sres* sweeps reserve_frac,
+  # not the window), so there is nothing for the default to silently override.
+  RESAMPLE_WINDOWS="${RESAMPLE_WINDOWS:-0.25:0.35}"
+  # BOTH KEYS OR NEITHER. resample_windows says WHERE resampling is permitted, schedule_start_frac
+  # says where the SCORING EVENTS fall. They are one setting in two fields and are meaningless apart:
+  # at the config default start_frac=0.5 the events land at 100-180, DISJOINT from a 0.25:0.35 window,
+  # so ZERO resamples fire and the arm degrades to transport-only. Emitting only the window and
+  # relying on the launcher to pass the other through EXTRA_SET makes two env vars that must move in
+  # lockstep, and an arm that forgets one runs inert. Bound together here so a CAST arm cannot be
+  # built half-configured, and the preflight rejects the unpaired form with "no steering event falls
+  # inside the resample window".
+  SCHEDULE_START_FRAC="${SCHEDULE_START_FRAC:-0.25}"
+  RW_SET=""
+  [ -n "$RESAMPLE_WINDOWS" ] && RW_SET="method.diffusion_search.resample_windows=$RESAMPLE_WINDOWS \
+  method.diffusion_search.schedule_start_frac=$SCHEDULE_START_FRAC"
+  COMMON="method.diffusion_search.algorithm=$ALGO method.diffusion_search.reward=$REWARD \
+  method.diffusion_search.rmsd_subset=paratope method.diffusion_search.sweep_units=$UNITS \
+  method.diffusion_search.subsample_pool=$SUBSAMPLE_POOL \
+  method.diffusion_search.weight_level_correction=$WEIGHT_LEVEL_CORRECTION \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA $RW_SET $EXTRA_SET"
+  # DEFERRED SCORING MUST NOT BE SILENT. SCORE_JOBS=0 skips BOTH the inline scorer and the exit
+  # sweep, so if no external scorer is actually running the whole run finishes with zero scored
+  # units, no error, and a healthy-looking log. Check the heartbeat pool-score writes, warn loudly,
+  # and leave a marker in the run dir so an unscored run is discoverable afterwards.
+  # DUPLICATED ACROSS THE POOL TEMPLATES ON PURPOSE. Each template is frozen verbatim into its job
+  # spec at submit time, so a sourced shared helper would not travel with the job and would leave the
+  # guard silently absent on the cluster. FIVE copies carry it -- steer, tds, cast, cast-ablation
+  # and baseline. tts-b0b-pool.yaml does not, which is why the count is not "all pool templates".
+  # Keep them byte-identical. Compare with -F, since an unescaped `\[` matches nothing and makes
+  # the md5s agree vacuously, and ANCHOR ON `; then` so the pattern does not also match the example
+  # line in this comment:
+  #   for f in jobs/tts-{steer,tds,cast,cast-ablation,baseline}-pool.yaml; do \
+  #     grep -A14 -F 'if [ "$SCORE_JOBS" -eq 0 ]; then' "$f" | md5sum; done   # one hash, 5 times
+  if [ "$SCORE_JOBS" -eq 0 ]; then
+    _hb="$RUN_DIR/queue/.pool_score_hb"
+    _age=99999
+    # `cat` on an empty or half-written stamp yields "", and $(( now -  )) is a bash
+    # SYNTAX ERROR that kills the worker before it runs a single unit. The writer
+    # renames into place, and this accepts only an all-digit stamp, so a torn read
+    # degrades to "no heartbeat" instead of to a crash.
+    _ts=$(cat "$_hb" 2>/dev/null | tr -dc '0-9')
+    [ -n "$_ts" ] && _age=$(( $(date +%s) - _ts ))
+    if [ "$_age" -gt 900 ]; then
+      echo "!! SCORE_JOBS=0 but no live pool-score heartbeat at $_hb (age ${_age}s)."
+      echo "!! Nothing in this pod will score these units. Start it on a CPU pod:"
+      echo "!!   python jobs/tts_job_lib.py pool-score --run-dir $RUN_DIR"
+      date -u > "$RUN_DIR/NEEDS_EXTERNAL_SCORING"
+    else
+      echo "[scoring] deferred to pool-score (heartbeat ${_age}s old)"
+      rm -f "$RUN_DIR/NEEDS_EXTERNAL_SCORING" 2>/dev/null || true
+    fi
+  fi
+  ARMS=()
+  # THE CONTROL IS OMITTED BY DEFAULT (SKIP_CTRL defaults to 1). Set SKIP_CTRL=0 to run one here.
+  # A control is guidance_scale=0 and every steering field is INERT there, so a ctrl unit depends
+  # only on (target, seed, n_samples, backend): identical across maps, umbrellas, d*, clips and
+  # schedules. Adding one to EVERY job makes a campaign split over several jobs re-run it each
+  # time, about 3 GPU-hours per redundant copy at 8 targets x 240 samples, so it is opt-in and
+  # reused instead. A steered arm reported without a control at ITS OWN budget has no baseline:
+  # the unsteered pool used to build the epitope map is a different template at a different
+  # budget and is NOT a substitute.
+  if [ "${SKIP_CTRL:-1}" != "1" ]; then
+    # NO SETS AT ALL, and that is the whole point -- the SETS field below is deliberately empty.
+    # subsample_pool must NOT travel to the control: it is a hook field, so setting it would build a
+    # search spec, install the hook, and stop this arm being Best-of-N. A correct ctrl unit records
+    # diffusion_side=best_of_n with no algorithm, and its run log contains zero occurrences of
+    # steering-ATTACHED, tds-step, RESAMPLE, reward-gradient and guidance-step.
+    # The conditioning mismatch that leaves is real but is an EXPERIMENTAL-DESIGN choice, not a bug:
+    # this control draws 1 subsample x N samples while CAST draws K subsamples over one N-particle
+    # pool. Match the total budget, and say which you matched.
+    # THE CONTROL IS PURE BEST-OF-N, same as tts-steer-pool.yaml.
+    # Mode `stock` with NO diffusion_search sets, so run_ablation builds no search spec and the hook
+    # is never installed. An `inert` arm (algorithm=fk, lam=0, guidance_scale=0) is NOT equivalent:
+    # it installs the hook and is a DIFFERENT SAMPLER even with no steering force, drawing ONE
+    # coupled trajectory over the population where stock Protenix draws an independent one per
+    # chunk. A control that beats the unsteered baseline understates every gain measured against
+    # it.
+    ARMS+=("ctrl|stock|")
+  else
+    echo "[arms] control omitted (SKIP_CTRL default 1). Reuse a ctrl at the same target/seed/n_samples, or set SKIP_CTRL=0 to run one here."
+  fi
+  # ORACLE arms are OPT-IN here, unlike tts-tds-pool.yaml where they are unconditional. CAST's
+  # deployable claim is the hybrid-map arm, a ground-truth map is an upper BOUND, not a result, and
+  # running it by default means every drained queue spends two thirds of its GPU time on numbers
+  # that cannot be reported as the method. Set WANT_GT=1 for the ceiling (decided at the top, where
+  # it also governs whether EPI_TRUE is required at all).
+  if [ "$WANT_GT" = "1" ]; then
+  # ORACLE arm: the known epitope, one patch. The ceiling any deployable arm is measured against.
+  ARMS+=("gt|steer|$COMMON method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=ground_truth")
+  # HINGE arm: identical to `gt` except the site term is one-sided, so a particle already CLOSER than
+  # its umbrella target feels no force. The two-sided harmonic pulls docked structures back out,
+  # which costs exactly the targets the model already solves. Bounding the far side too
+  # (site_huber_delta) keeps a distant, possibly wrong, site from saturating the clip and tearing
+  # the fold.
+  ARMS+=("gthinge|steer|$COMMON method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=ground_truth \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER \
+  method.diffusion_search.site_contact_gate=${CGATE:-0.0} \
+  method.diffusion_search.site_floor=${FLOOR:-0.0}")
+  fi
+
+  # MULTI-SITE arms: the map holds several candidate patches, so the reward hedges over them. Its umbrella sweep MUST be narrower -- cells = sites x umbrellas, and the house
+  # 6-umbrella sweep at 3 sites leaves 2.8 particles per cell, where within-cell resampling
+  # degenerates to the identity (base_search.check_cell_budget). UMBRELLA3 defaults to the value
+  # base_search.auto_umbrellas picks for 50 particles x 3 sites, placed at the measured native-d*
+  # quantiles rather than by hand.
+  UMBRELLA3="${UMBRELLA3:-10.1,13.6}"       # base_search.auto_umbrellas(50 particles, 3 sites)
+  if [ -n "$EPI_PRED3" ]; then
+    ARMS+=("pred3|steer|method.diffusion_search.algorithm=$ALGO method.diffusion_search.reward=$REWARD \
+  method.diffusion_search.rmsd_subset=paratope method.diffusion_search.sweep_units=$UNITS \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA3 method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted")
+  fi
+  # MODE_EXTRA lets the mode3 arm carry reward-shape flags (site_hinge etc) without a separate arm,
+  # so hedging and reward shape can be combined without duplicating the definition.
+  if [ -n "$EPI_MODE3" ]; then
+    ARMS+=("mode3|steer|method.diffusion_search.algorithm=$ALGO method.diffusion_search.reward=$REWARD \
+  method.diffusion_search.rmsd_subset=paratope method.diffusion_search.sweep_units=$UNITS \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA3 method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted \
+  ${MODE_EXTRA:-}")
+  fi
+  # HYBRID/ENSEMBLE arm. Same spec as `mode3` except for the map, so a mode3-vs-hybens comparison
+  # isolates the MAP and nothing else. HYBENS_EXTRA is the same escape hatch MODE_EXTRA is for
+  # mode3: reward-shape flags without a second arm definition.
+  #
+  # FOUR UMBRELLAS, matching $UMBRELLA and every other steered arm. A single value ("12") would
+  # avoid the cells this map's ~15 sites make, but the budget already covers them: at N=720, K=4 the
+  # site counts are 13/14/15, giving 52-60 cells, 12-13 particles per cell and 3 per (cell, latent),
+  # at MIN_PER_SUBSAMPLE and none below it. A single umbrella would also make the headline arm the
+  # ONLY steered arm without the umbrella axis, which is not something a reader would infer.
+  # If N is ever cut below ~600, re-derive: the per-(cell, latent) floor is what binds first.
+  UMBRELLA_HYBENS="${UMBRELLA_HYBENS:-9,11,13,15}"
+  # BUILT FROM $COMMON, NOT FROM SCRATCH. The sibling arms above spell their options out literally,
+  # which silently DROPS everything $COMMON carries: subsample_pool, weight_level_correction, $RW_SET
+  # and $EXTRA_SET. That is not cosmetic -- subsample_pool defaults to 1 and the joint
+  # cross-subsample pool is gated on `> 1`, so a hand-rolled arm cannot run the joint model AT ALL,
+  # no matter what the launcher exports. An arm launched that way at K>1 runs with subsample_pool=1,
+  # weight_level_correction=false and a resample window disjoint from its scoring events, so the
+  # joint pool never fires, the level correction is off and ZERO resamples occur, while the log
+  # looks entirely healthy. $COMMON first, arm-specific overrides after, because later keys win.
+  if [ -n "$EPI_HYBENS" ]; then
+    ARMS+=("hybens|steer|$COMMON \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA_HYBENS method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted \
+  ${HYBENS_EXTRA:-}")
+  fi
+  # NON-ENSEMBLE HYBRID ARM. Byte-identical to `hybens` except for the map, so a hybens-vs-hybk12
+  # run isolates the MAP and nothing else -- which is exactly the confound that has to be cleared
+  # before any claim about steering on a target where the two maps disagree.
+  # ITS OWN DEFAULT, NOT $UMBRELLA_HYBENS. These are two DIFFERENT MAPS -- hybk12 is the single
+  # tiled map this paper reports, hybens the mode-ensemble -- and an inherited default silently ties
+  # the reported arm's stratification to a map it does not use. A hybens default of "12" propagating
+  # here would make the reported arm the only steered arm without the 4-umbrella axis, with nothing
+  # in the config or the logs saying so. Whoever edits one of these must edit the other
+  # deliberately, or not at all.
+  UMBRELLA_HYBK12="${UMBRELLA_HYBK12:-9,11,13,15}"
+  if [ -n "$EPI_HYBK12" ]; then
+    ARMS+=("hybk12|steer|$COMMON \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA_HYBK12 method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted \
+  ${HYBK12_EXTRA:-}")
+  fi
+  # ---- REWARD-SHAPE TRIALS. One gate each, every other gate left at its default, so an arm can only
+  # differ from its baseline in the single term named after it. m3soft/m3cap baseline against the
+  # mode3+hinge arm, gtgate against the ground-truth hinge arm.
+  MODE3_BASE="method.diffusion_search.algorithm=$ALGO method.diffusion_search.reward=$REWARD \
+  method.diffusion_search.rmsd_subset=paratope method.diffusion_search.sweep_units=$UNITS \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA3 method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER"
+  if [ -n "$EPI_MODE3" ]; then
+    # GATE: score each particle against the candidate site it is ALREADY nearest, instead of the
+    # one its index was assigned. Targets the Mode3 pool collapse.
+    ARMS+=("m3soft|steer|$MODE3_BASE method.diffusion_search.site_softmin_tau=${TAU:-2.0}")
+    # GATE: release a particle whose separation is more than dev_cap from its target, instead of
+    # pulling it forever toward a patch the predictor may have placed on the wrong face.
+    ARMS+=("m3cap|steer|$MODE3_BASE method.diffusion_search.site_dev_cap=${DEVCAP:-12.0}")
+    # the same hedge on the PREDICTED (mode3) map -- see the note in the m3s block below
+    ARMS+=("mode3res25|steer|$MODE3_BASE method.diffusion_search.reserve_enabled=true method.diffusion_search.reserve_frac=0.25")
+    # SWEEP of the same gate. Calibrating dev_cap from FINAL structures does not work: by the
+    # endpoint steering has pulled every particle onto its umbrella, so |d - d*| is small and a
+    # 12 A cap releases nothing, yet the 12 A arm still changes the result. The cap therefore acts
+    # MID-trajectory, where x0-hat is still far from any patch, so the response curve has to be
+    # measured rather than predicted. Hence a wide bracket around the one known-good value.
+    for _c in ${CAPS:-4 8 16 32}; do
+      ARMS+=("m3cap${_c}|steer|$MODE3_BASE method.diffusion_search.site_dev_cap=${_c}.0")
+    done
+    # Softmin AND cap together. They act on different failure modes, picking the right patch
+    # versus abandoning a wrong one, so the union is not implied by either alone.
+    ARMS+=("m3softcap|steer|$MODE3_BASE method.diffusion_search.site_softmin_tau=${TAU:-2.0} \
+  method.diffusion_search.site_dev_cap=${DEVCAP:-12.0}")
+    # The CONTACT term on top of the cap. A centroid-distance reward says where to sit and nothing
+    # about orientation, so it can recover native contacts while degrading interface geometry.
+    # contact_shell is short-range, non-zero only within ~11 A and exactly 0 beyond ~15 A, so it
+    # refines geometry where the antibody already arrived and cannot disturb a wrong patch.
+    # CONWEIGHT is 40, not 1: the site term's dynamic range is about 80x the contact term's, so a
+    # weight of 1 would be inert.
+    ARMS+=("m3capcon|steer|method.diffusion_search.algorithm=$ALGO \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=${CONWEIGHT:-40.0} \
+  method.diffusion_search.rmsd_subset=paratope method.diffusion_search.sweep_units=$UNITS \
+  method.diffusion_search.umbrella_sweep=$UMBRELLA3 method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=predicted \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER \
+  method.diffusion_search.site_dev_cap=${DEVCAP:-12.0}")
+  fi
+  if [ -n "$EPI_GT" ]; then
+    # GATE: hinge on ACTUAL interface contact rather than on distance alone.
+    ARMS+=("gtgate|steer|$COMMON method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=ground_truth \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER \
+  method.diffusion_search.site_contact_gate=${CGATE:-0.25}")
+    # site_contact_gate thresholds the SHARE of epitope residues within 10 A of any paratope
+    # residue. That share is high enough on real output that 0.25 counts nearly every structure as
+    # docked, collapsing `near & docked` to `near` and reproducing the plain hinge, so the gate is
+    # set at 0.75.
+    ARMS+=("gtgate75|steer|$COMMON method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=ground_truth \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER \
+  method.diffusion_search.site_contact_gate=${CGATE2:-0.75}")
+    # ---- UMBRELLA-COUNT SWEEP on the ground-truth map. Everything except the sweep is the plain
+    # hinge, the established GT baseline, so any difference is the number of binding hypotheses the
+    # pool probes, not the reward shape.
+    # The multi-site arms are forced to 2 umbrellas per site by the cell budget, so this measures
+    # what that restriction costs when the map is correct.
+    # GTBASE inherits umbrella_sweep=$UMBRELLA from $COMMON, and EVERY gt* arm below appends its
+    # own, so each spec string carries the key twice. That is deliberate and safe: overrides are
+    # merged by OmegaConf.from_dotlist, which is LAST-WINS, so the arm value is the one that takes
+    # effect. Do not "tidy" this by dropping the arm-level copy.
+    GTBASE="$COMMON method.diffusion_search.guidance_scale=${SCALE}.0 \
+  $CLIP_SET method.diffusion_search.epitope_source=ground_truth \
+  method.diffusion_search.site_hinge=$SITE_HINGE method.diffusion_search.site_huber_delta=$SITE_HUBER"
+    ARMS+=("gtu1|steer|$GTBASE method.diffusion_search.umbrella_sweep=12")
+    ARMS+=("gtu2|steer|$GTBASE method.diffusion_search.umbrella_sweep=10.1,13.6")
+    ARMS+=("gtu3|steer|$GTBASE method.diffusion_search.umbrella_sweep=9,12,15")
+    ARMS+=("gtu12|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17")
+    # ---- APPROACH-DIRECTION TERM on top of the best site-only arm. The site reward is a function
+    # of ||mu_p - mu_e|| ALONE, so it pins ONE of six degrees of freedom and every point on the
+    # sphere of radius d* scores identically. The pool approaches at a much wider angle from its own
+    # outward normal than real complexes do, and the targets that are badly directed are the
+    # low-DockQ ones.
+    # WEIGHTS CALIBRATED, not guessed: the median |g_site| / |g_direction| over real structures sets
+    # PARITY, and the quarter point is a quarter of it. This is the same procedure that set the
+    # facing weights.
+    # The control is gtu12s100, re-run here so the comparison sits on ONE code tree.
+    for _dw in 7 27; do
+      ARMS+=("gtu12d${_dw}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.direction_enabled=true method.diffusion_search.direction_weight=${_dw}.0")
+    done
+    # ---- UMBRELLA COUNT RE-RUN AT 100 SAMPLES PER SEED, hinge and contact side by side.
+    # WHY 100 AND NOT 50. The cell budget is per TILTED particle and the earlier sweep ran at 50:
+    # 12 umbrellas gave 4-5 per cell and 9 gave 5-6, both under the min_per_cell=6 floor where a
+    # within-cell resample degenerates toward the identity (base_search.check_cell_budget), so the
+    # sweep may not have been selecting at all. At 100 the same counts give 8-9 and 11-12, clear of
+    # the floor, so the umbrella count is measured where the mechanism is known to be live.
+    # U=9 spans the same 7..17 native range as U=12, evenly at 1.25 A.
+    # Explicit pairs, NOT indirect expansion (`eval "_uv=\$U${_u}"`): with eval a typo in a name
+    # yields an EMPTY sweep silently, which is how "no sweep" is legitimately expressed, so the arm
+    # would run one d* instead of the count it is named for and nothing would say so.
+    for _pair in "2:10.1,13.6" \
+                 "9:7,8.25,9.5,10.75,12,13.25,14.5,15.75,17" \
+                 "12:7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17"; do
+      _u="${_pair%%:*}"; _uv="${_pair#*:}"
+      [ -n "$_uv" ] || { echo "!! empty umbrella sweep for U=$_u"; exit 2; }
+      # HINGE (site only), the gtu family re-measured at the larger pool.
+      ARMS+=("gtu${_u}s100|steer|$GTBASE method.diffusion_search.umbrella_sweep=$_uv")
+      # SITE+CONTACT at weight 30, the gtc30 reward at each umbrella count.
+      ARMS+=("gtc30u${_u}s100|steer|$GTBASE method.diffusion_search.umbrella_sweep=$_uv \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=30.0")
+    done
+    # The release cap on the ORACLE map. It is the term with the largest effect on the predicted
+    # map, so this arm asks whether it costs anything when the map is already correct.
+    ARMS+=("gtcap|steer|$GTBASE method.diffusion_search.umbrella_sweep=$UMBRELLA \
+  method.diffusion_search.site_dev_cap=${DEVCAP:-12.0}")
+    # Both far-side and near-side terms at once. They act on disjoint particles, the cap releasing
+    # those beyond dev_cap and the gate narrowing which NEAR particles the hinge protects, so
+    # neither implies the other.
+    ARMS+=("gtcapgate|steer|$GTBASE method.diffusion_search.umbrella_sweep=$UMBRELLA \
+  method.diffusion_search.site_dev_cap=${DEVCAP:-12.0} \
+  method.diffusion_search.site_contact_gate=${CGATE2:-0.75}")
+    # The 0.75 gate at the two umbrella counts that perform best, rather than at the 6-umbrella
+    # default it was originally set on.
+    ARMS+=("gtu2gate|steer|$GTBASE method.diffusion_search.umbrella_sweep=10.1,13.6 \
+  method.diffusion_search.site_contact_gate=${CGATE2:-0.75}")
+    ARMS+=("gtu12gate|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.site_contact_gate=${CGATE2:-0.75}")
+    # CONTACT TERM on the ground-truth map, at its best umbrella count. The site term fixes ONE
+    # scalar of a 6-DOF pose and is satisfied to <1 A by every particle while LRMS stays ~0.07, so
+    # this is the only measured knob that adds orientation rather than more placement pressure.
+    for _cw in 10 30 50 70 100; do
+      ARMS+=("gtc${_cw}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=${_cw}.0")
+    done
+    # FACING / ORIENTATION on the GROUND-TRUTH map -- the ORACLE setting, run FIRST on purpose.
+    # If the term cannot help when the epitope is known, it cannot help when it is predicted, so
+    # this is the cheaper question and it gates the deployable arms (m3sc30f*, defined in the m3s
+    # block below). Control is gtc30, directly above.
+    # Weights CALIBRATED: over 96 real structures |g_contact|/|g_facing| has median 2.3 and the
+    # contact term enters at 30, so PARITY is 68, 17 is the quarter point. The dominant point is
+    # omitted -- gtc100 already showed what one term overwhelming the others does.
+    for _fw in 17 68; do
+      ARMS+=("gtc30f${_fw}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=30.0 \
+  method.diffusion_search.facing_enabled=true method.diffusion_search.facing_weight=${_fw}.0")
+    done
+    # STAGED TILTING. The ungated facing arms fail WORST where their mechanism predicts best, on
+    # the most register-blind targets. The leading explanation is TIMING: every interface term
+    # tested acts across the whole schedule, where it can only move PLACEMENT, while the interface
+    # is decided late, by the prior, once the body is placed.
+    # THRESHOLDS FROM THE SAMPLER'S OWN SCHEDULE, not guessed. Its Karras schedule reconstructs from
+    # the logged sigma as sigma_max 2560, sigma_min 0.0077, rho 7.00 over 200 steps. Two markers
+    # bracket the choice:
+    #   sigma ~18.6 (step 120) is where the guidance gradient STOPS saturating the clip
+    #                (|dx|_F 285 < 700), i.e. the structure has settled.
+    #   sigma ~2.0  is the contact shell's own width (contact_sigma), below which the noise is
+    #                finally smaller than the geometric feature the facing term measures.
+    # 5.0 -> facing active for the last 59 of 200 steps (30%); 2.0 -> the last 47 (24%).
+    # Controls already exist on this tree at matched budget: gtc30 and the UNGATED gtc30f68.
+    for _sg in 5 2; do
+      ARMS+=("gtc30f68s${_sg}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=30.0 \
+  method.diffusion_search.facing_enabled=true method.diffusion_search.facing_weight=68.0 \
+  method.diffusion_search.facing_sigma_max=${_sg}.0")
+    done
+    # Does the clash term rescue the contact term? At contact_weight=100 the paratope-epitope
+    # centroid distance falls to 2-3 A against a d* of 12 A and a shell peaking at 8 A, i.e. the
+    # contact term pulls the paratope THROUGH the antigen, which is what the clash penalty opposes.
+    # The clash weights are calibrated, not guessed: both terms add into the same g_tok and the
+    # gradient ratio |g_contact| / |g_clash| is of order a few hundred, so a weight of order 1 would
+    # be inert. The three values bracket quarter, parity and dominant.
+    for _kw in 100 400 1600; do
+      ARMS+=("gtc100k${_kw}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=100.0 \
+  method.diffusion_search.clash_enabled=true method.diffusion_search.clash_weight=${_kw}.0")
+    done
+    # DO-NO-HARM control: the clash term on the contact weight that already WORKS. If parity clash
+    # degrades this, the term is not free and any rescue at 100 has to be read against that cost.
+    ARMS+=("gtc30k400|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=30.0 \
+  method.diffusion_search.clash_enabled=true method.diffusion_search.clash_weight=400.0")
+    # d_min RE-TEST. The first clash sweep was NEGATIVE at every weight although the term did its
+    # job and removed most clashes. The do-no-harm control diagnosed it: an arm with nothing to fix
+    # still lost DockQ, so the penalty was firing on structures with no clash problem.
+    # clash_d_min=4.0 A is above the real contact distance, since antibody-antigen contacts sit at
+    # 3.5-4 A and the PoseBusters criterion is 0.75*(vdW sum), about 2.55 A for carbon. So the term
+    # was penalising NATIVE contacts. The weight was right, the DISTANCE was wrong by ~1.5 A.
+    # SATURATING CONTACT AGGREGATION. The contact shell is correctly PEAKED at r_contact, but it is
+    # aggregated as a MEAN OVER ALL paratope x epitope pairs, and that mean is maximised by putting
+    # MORE pairs in the shell, which a deeper interface achieves. On a synthetic docking path,
+    # pushing a pose from docked to buried RAISES the mean form sharply while the saturating form
+    # gains a little and then turns DOWN. So the weight-100 pathology is an AGGREGATION bug.
+    # Saturating credits each paratope residue with its best partner only, which is what fnat
+    # measures, and fnat gates DockQ.
+    for _tau in 0.05 0.15; do
+      _tg=$(echo "$_tau" | tr -d .)
+      for _cw in 30 100; do
+        ARMS+=("gtc${_cw}sat${_tg}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=${_cw}.0 \
+  method.diffusion_search.contact_saturate_tau=${_tau}")
+      done
+    done
+    for _dm in 2.5 3.0; do
+      _tag=$(echo "$_dm" | tr -d .)
+      ARMS+=("gtc100k400d${_tag}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=100.0 \
+  method.diffusion_search.clash_enabled=true method.diffusion_search.clash_weight=400.0 \
+  method.diffusion_search.clash_d_min=${_dm}")
+      ARMS+=("gtc30k400d${_tag}|steer|$GTBASE method.diffusion_search.umbrella_sweep=7,7.9,8.8,9.7,10.6,11.5,12.4,13.3,14.2,15.1,16,17 \
+  method.diffusion_search.reward=site_contact method.diffusion_search.contact_weight=30.0 \
+  method.diffusion_search.clash_enabled=true method.diffusion_search.clash_weight=400.0 \
+  method.diffusion_search.clash_d_min=${_dm}")
+    done
+  fi
+
+  # ---- ARM SELECTION. All by default, because a deployable arm on its own cannot be interpreted:
+  #      `ctrl` says whether steering helped at all, and `gt` is the oracle ceiling that splits a
+  #      failure into "the epitope map was wrong" from "the method does not work". Narrow it only
+  #      when iterating, e.g. ARMS_ONLY="pred3 mode3" to compare the two deployable maps, or ARMS_ONLY="hybens"
+  #      to run only the ensemble-hybrid arm without the unconditional oracle gt/gthinge arms.
+  #      An unknown name is a HARD ERROR: silently running zero arms would look like a finished grid.
+  _all=${#ARMS[@]}
+  if [ -n "${ARMS_ONLY:-}" ]; then
+    _sel=(); _bad=""
+    for _w in $ARMS_ONLY; do
+      _hit=""
+      for A in "${ARMS[@]}"; do [ "${A%%|*}" = "$_w" ] && { _sel+=("$A"); _hit=1; }; done
+      [ -n "$_hit" ] || _bad="$_bad $_w"
+    done
+    [ -n "$_bad" ] && { echo "!! ARMS_ONLY names no such arm:$_bad"; echo "!! built this run:$(for A in "${ARMS[@]}"; do printf \' %s\' "${A%%|*}"; done)"; exit 2; }
+    [ ${#_sel[@]} -eq 0 ] && { echo "!! ARMS_ONLY selected zero arms"; exit 2; }
+    ARMS=("${_sel[@]}")
+    echo "[arms] ARMS_ONLY=$ARMS_ONLY -> running ${#ARMS[@]} of ${_all} arms"
+  fi
+
+  # PF=0 FIRST. Under `set -u` an unset PF makes the gate below abort with "unbound variable"
+  # on exactly the HEALTHY path -- no arm fails, so nothing ever assigns it. tts-steer-pool.yaml
+  # has this line, it was dropped when this template was derived from it.
+  PF=0
+  for A in "${ARMS[@]}"; do
+    TAG=${A%%|*}; REST=${A#*|}; MODE=${REST%%|*}; SETS=${REST#*|}
+    PFSET=$(echo "$SETS" | tr ' ' '\n' | sed 's/^method\.diffusion_search\.//' | tr '\n' ' ')
+    # EXPORT THE ARM'S OWN MAP FIRST. preflight cross-checks $PROTENIX_EPITOPE_MAP against
+    # epitope_source, so without this the gate fails EVERY steered arm ("reward=epitope needs
+    # $PROTENIX_EPITOPE_MAP") -- i.e. it rejected exactly the arms it exists to validate, and no
+    # submission of this template could ever reach a GPU.
+    export PROTENIX_EPITOPE_MAP="$(arm_epitope_map "$TAG")"
+    # Declare the builder alongside the map so the gate compares two INDEPENDENT statements. Only
+    # appended when non-empty, so the ground-truth arms keep byte-identical settings to before.
+    ARM_BUILDER="$(arm_epitope_builder "$TAG")"
+    [ -n "$ARM_BUILDER" ] && PFSET="$PFSET epitope_map_builder=$ARM_BUILDER"
+    # DECLARE THE REAL POOL SIZE. preflight defaults to n_particles=8, and its subsample_pool
+    # per-cell capacity check divides that by the umbrella count -- so an honest joint config
+    # (K=4, 720 particles, 4 umbrellas = 180 per umbrella) is rejected as "2 per cell" purely
+    # because the gate was told the pool holds 8. preflight's own comment says n_particles is the
+    # size the CALLER declares, and this template is the only place that sees N_SAMPLES.
+    if python "$STATS_DIR/tts_job_lib.py" preflight --n-particles "$N_SAMPLES" --set $PFSET > "$RUN_DIR/pf_$TAG.txt" 2>&1; then
+      PFOK=1; else PFOK=0; fi
+    if [ "$MODE" = stock ]; then
+      echo "[preflight] $TAG: stock sampler, no spec to validate"; continue
+    fi
+    if [ "$MODE" = inert ]; then
+      # A CONTROL MUST BE INERT. If it starts passing the steering gate it is secretly steering and
+      # every delta measured against it is wrong. Once inert it is also a VALID Best-of-N baseline,
+      # with no detectable distribution shift against the stock sampler.
+      [ $PFOK -eq 1 ] && { echo "!! $TAG is declared a CONTROL but preflight says it steers"; PF=1; }
+    else
+      [ $PFOK -eq 1 ] || { echo "!! arm $TAG failed preflight"; sed 's/^/      /' "$RUN_DIR/pf_$TAG.txt"; PF=1; }
+    fi
+  done
+  [ $PF -ne 0 ] && { echo "!! PREFLIGHT FAILED -- aborting before any GPU work"; exit 1; }
+  echo "[preflight] all ${#ARMS[@]} arms valid"
+
+  # ---- seed the queue (idempotent: every worker tries, `mkdir` makes it a no-op for the losers) ----
+  for TGT in $TARGETS; do
+    for A in "${ARMS[@]}"; do
+      U="${TGT}__${A%%|*}"
+      [ -d "$DONE/$U" ] && continue
+      mkdir -p "$PENDING/$U" 2>/dev/null
+      printf '%s' "$A" > "$PENDING/$U/spec" 2>/dev/null || true
+    done
+  done
+  # QUEUE INVARIANT REPAIR. done/ is authoritative: a unit left in pending/ or claimed/ after it has
+  # completed gets RE-RUN, wasting a full arm. Duplicates arise whenever a claim is returned to
+  # pending by a reclaim that races the worker still finishing it. Repair on every startup so the
+  # pool self-heals rather than needing a human to notice the counts drifting.
+  for U in $(ls "$DONE" 2>/dev/null); do rm -rf "$PENDING/$U" "$CLAIMED/$U"; done
+  for U in $(ls "$CLAIMED" 2>/dev/null); do rm -rf "$PENDING/$U"; done
+
+  # total unit count, written once: a summary/merge can gate on done+failed == N_UNITS rather than
+  # guessing when the pool is finished (tts-b0b-pool.yaml uses N_TARGETS the same way).
+  [ -f "$Q/N_UNITS" ] || echo $(( $(ls "$PENDING" 2>/dev/null | wc -l) + $(ls "$CLAIMED" 2>/dev/null | wc -l) + $(ls "$DONE" 2>/dev/null | wc -l) )) > "$Q/N_UNITS"
+  echo "queue: $(ls "$PENDING" 2>/dev/null | wc -l) pending / $(ls "$DONE" 2>/dev/null | wc -l) done / $(cat "$Q/N_UNITS") total"
+
+  # DRY_RUN=1 stops here: the arm list, the preflight gate and the queue are all exercised, but no
+  # GPU is touched. Use it to check a grid definition before spending GPU-hours on it.
+  if [ "${DRY_RUN:-0}" = "1" ]; then
+    echo "[dry-run] ${#ARMS[@]} arms, $(ls "$PENDING" 2>/dev/null | wc -l) queued"
+    for A in "${ARMS[@]}"; do echo "  arm: ${A%%|*}"; done
+    # CONFIG/FAMILY CHECK. preflight validates spec FIELDS only, run_ablation separately rejects an
+    # algorithm that is not in the config's declared family. Take the first steered arm through the
+    # real dispatch (--dry-run skips inference) so a family mismatch fails HERE, not on a GPU.
+    for A in "${ARMS[@]}"; do
+      TAG=${A%%|*}; REST=${A#*|}; MODE=${REST%%|*}; SETS=${REST#*|}
+      [ "$MODE" = steer ] || continue
+      CFG=$(cfg_for_backend experiments/configs/diffusion_side/m5_cast.yaml) || exit 5
+      [ "$MODE" = stock ] && { CFG=$(cfg_for_backend experiments/configs/baseline/b0b.yaml) || exit 5; }
+      T=$(mktemp -d); mkdir -p "$T/src"
+      cp "$INPUTS_WIRED/$(echo $TARGETS | awk '{print $1}').json" "$T/src/" 2>/dev/null
+      echo -n "  [dry-run] dispatch check on $TAG via $(basename $CFG): "
+      if timeout 600 python -m experiments.scripts.run_ablation --config "$CFG" --dry-run \
+           --set $SETS model.run.msa_subsample.source_inputs_dir="$T/src" model.seeds=[$SEED0] \
+                 model.run.n_samples_per_seed=2 model.run.msa_subsample.n_seeds=1 \
+                 paths.inputs_dir="$T/i" paths.predictions_dir="$T/p" paths.results_dir="$T/r" \
+           > "$T/dry.log" 2>&1; then echo OK
+      else echo FAILED; grep -aE "ValueError|Error" "$T/dry.log" | tail -2; rm -rf "$T"; exit 4; fi
+      rm -rf "$T"; break
+    done
+    echo "[dry-run] stopping before GPU work"
+    exit 0
+  fi
+
+  # BASE_EXTRA IS THE CHANNEL FOR FULL CONFIG PATHS, and $EXTRA_SET is NOT a substitute for it.
+  # An arm's option string is preflight-validated by stripping the `method.diffusion_search.` prefix
+  # and handing every remaining token to `tts_job_lib.py preflight`, which only knows
+  # DiffusionSearchSpec fields. So a token like `metrics.dockq.bin=...` or
+  # `model.protenix2.checkpoint.public_model_name=...` placed in $EXTRA_SET fails the gate for every
+  # arm built from $COMMON, and is silently DROPPED by the arms that spell their options out by hand
+  # -- which is how a run once reached the GPU with its DockQ binary override never applied, scoring
+  # every structure NaN. $BASE goes straight to run_ablation and is not preflight-validated, so
+  # config-path overrides belong here. Keep $EXTRA_SET for `method.diffusion_search.*` keys only.
+  BASE="$DET_SET model.run.nproc_per_node=1 \
+  model.run.n_samples_per_seed=$N_SAMPLES model.run.msa_subsample.n_seeds=$N_SEEDS ${BASE_EXTRA:-}"
+  # SEARCH-ONLY OVERRIDES ARE NOT IN $BASE, because $BASE goes to EVERY arm including `stock`.
+  # A stock arm is pure Best-of-N: run_ablation builds no search spec for diffusion_side=best_of_n,
+  # so `method.diffusion_search.*` is inert there -- but it is still RECORDED, and a BoN run's
+  # config.yaml came out carrying `diffusion_search: {physicality_filter: False}`. That reads as
+  # "this run had a search block" to anyone auditing provenance later, which is exactly the kind of
+  # thing the recorded config exists to settle. Applied per arm below instead, never to stock.
+  BASE_SEARCH="method.diffusion_search.physicality_filter=false"
+  # THE CONTROL IS MATCHED ON BOTH AXES: same K MSA subsamples, same total structures.
+  # $BASE alone does not do that. It hands every arm n_samples_per_seed=$N_SAMPLES, and for a stock
+  # arm that is PER SEED -- so with n_seeds=K the control would draw K x N_SAMPLES (2880 at K=4,
+  # N=720) against CAST's N + K - 1 (723). A control with 4x the draws is not a control: the metric
+  # is a MAX over the pool, so it rises with the count on its own and the steering would be measured
+  # against a handicap it never had.
+  # Keep n_seeds=K (so BoN explores the SAME 4 subsamples the joint pool does -- latent diversity is
+  # not what is being tested) and cut the per-seed samples to N_SAMPLES/K:
+  #     CAST  720 particles in one filter over 4 latents  -> 723 files (720 pool + 3 single-particle
+  #                                                          stubs, which are trunk by-products and
+  #                                                          never the per-target max)
+  #     ctrl  4 seeds x 180 independent draws             -> 720 files
+  # Matched to 720 on the count that means anything, and matched exactly on the conditioning set.
+  # The ONLY thing that differs is the arrangement: one coupled tilted filter against four
+  # independent unsteered pools. That is the comparison.
+  BASE_CTRL="model.run.n_samples_per_seed=$(( N_SAMPLES / SUBSAMPLE_POOL ))"
+
+
+  # JOINT POOL ARITHMETIC, same spelling as tts-steer-pool.yaml. With K > 1 the K conditionings share
+  # ONE diffusion of N_SAMPLES particles and the first K-1 calls return a one-particle placeholder,
+  # so the run emits N_SAMPLES + K - 1 structures, NOT N_SEEDS * N_SAMPLES. The separate formula
+  # refuses every joint run as incomplete.
+  if [ "$SUBSAMPLE_POOL" -gt 1 ]; then
+    EXP_CIF=$(( N_SAMPLES + SUBSAMPLE_POOL - 1 ))
+  else
+    EXP_CIF=$(( N_SEEDS * N_SAMPLES ))
+  fi
+  unit_generated () {                # $1 = unit name -> 0 if every structure is already on disk
+    local O="$RUN_DIR/$1"
+    [ "$(find "$O/pred" -name '*.cif' 2>/dev/null | wc -l)" -ge "$EXP_CIF" ] || return 1
+    return 0
+  }
+
+  # A unit is COMPLETE only if it has an ANSWER, not merely structures. Stopping at "parquet file
+  # exists" lets a unit whose scoring died AFTER generation -- parquet written, dockq column
+  # entirely NaN -- count as complete, so every later resume skips it and the run can never produce
+  # a result for it.
+  # Cheap: one column of one parquet, and only for units that already passed the two cheaper tests.
+  # An unreadable parquet or missing pandas returns NOT complete, erring toward redoing work rather
+  # than silently keeping an empty result.
+  unit_scored () {                   # $1 = unit name -> 0 if dockq has at least one non-null value
+    "$SCORE_PY" -c 'import sys,pandas as pd; d=pd.read_parquet(sys.argv[1]); c="dockq_abag" if "dockq_abag" in d.columns else ("dockq" if "dockq" in d.columns else None); sys.exit(0 if c and int(d[c].notna().sum())>0 else 1)' "$RUN_DIR/$1/res/per_sample.parquet" >/dev/null 2>&1
+  }
+
+  unit_complete () {                 # $1 = unit name -> 0 if generated AND actually scored
+    local O="$RUN_DIR/$1"
+    [ -f "$O/res/per_sample.parquet" ] || return 1
+    unit_generated "$1" || return 1
+    unit_scored "$1"
+  }
+
+  # SEED-GRANULAR RESUME, separate model only, same switch as tts-steer-pool.yaml. A preempted worker
+  # leaves a unit with some MSA seeds fully predicted and others missing, unit_complete is
+  # all-or-nothing, so without this the unit restarts and REGENERATES the finished seeds. The skip
+  # itself happens in run_ablation, which owns the per-seed input construction -- this side only sets
+  # the switch, and it never drops every input.
+  # NOT FOR THE JOINT POOL: there the K subsamples share one diffusion, so a half-finished unit holds
+  # half a particle cloud rather than a finished seed, and the only correct thing is to redo it.
+  if [ "$SUBSAMPLE_POOL" -gt 1 ]; then
+    export TTS_RESUME_SEEDS=0
+  else
+    export TTS_RESUME_SEEDS="${TTS_RESUME_SEEDS:-1}"
+  fi
+
+  run_unit () {                      # $1 = target__tag unit name
+    local U="$1" TGT="${1%%__*}" TAG="${1##*__}"
+    # PARSE MODE FROM THE SPEC. Keeping only SETS would leave any $MODE reference here reading the
+    # global the arm-list loop left behind, which is the wrong arm's mode for every unit but the
+    # last.
+    local SPEC; SPEC=$(cat "$PENDING/$U/spec" 2>/dev/null || cat "$CLAIMED/$U/spec")
+    local MODE; MODE=${SPEC#*|}; MODE=${MODE%%|*}
+    local SETS; SETS=${SPEC#*|}; SETS=${SETS#*|}
+    local OUT="$RUN_DIR/${U}"; mkdir -p "$OUT"
+    local SRC="$OUT/src"; mkdir -p "$SRC"; cp "$INPUTS_WIRED/$TGT.json" "$SRC/"
+    # THE ONE THING THAT DIFFERS BETWEEN gt AND pred. Exported per arm, and preflight rejects the
+    # unit if it disagrees with method.diffusion_search.epitope_source in the spec.
+    export PROTENIX_EPITOPE_MAP="$(arm_epitope_map "$TAG")"
+    echo "    epitope map: $PROTENIX_EPITOPE_MAP"
+    # PER-ARM af3_red history: one arm must never be biased against another arm's structures.
+    # NESTED, AND NOT PRE-CREATED. A flat "$RUN_DIR/af3red_hist_${U}" with an unconditional mkdir
+    # drops an empty directory BESIDE the unit dirs for every unit of every arm, and any glob over
+    # "$RUN_DIR/*" then counts them as units. The hook makedirs this itself, and only inside the
+    # af3_red branch, so it is created if and only if it is used.
+    export PROTENIX_AF3RED_HIST_DIR="$RUN_DIR/_af3red_hist/${U}"
+    # a previous GPU-OOM on this unit forces the confidence stack onto host RAM for this attempt
+    if [ -f "$FORCE/$U" ]; then
+      export PROTENIX_CONF_OFFLOAD_TOKENS=0        # 0 = offload every target regardless of size
+      echo "    (retry with forced confidence-offload after a previous GPU OOM)"
+    fi
+    rm -f "$MG_FLAG" 2>/dev/null      # set only if the memguard kills this unit
+    echo "----- worker $WORKER_ID: $U $(date -u) -----"
+    local t0; t0=$(date +%s)
+    # PINNED, unlike tts-tds-pool.yaml which dispatches CFG off the arm's algorithm. This template
+    # runs ONE algorithm, so there is nothing to derive; a `case` here would be dead branches whose
+    # presence implies this file can run svgd or af3_red, which it cannot (ALGO=cast is fixed above).
+    local CFG; CFG=$(cfg_for_backend experiments/configs/diffusion_side/m5_cast.yaml) || return 5
+    # a stock arm carries NO diffusion_search sets, so it must load the best_of_n config or
+    # run_ablation would build a search spec from the config defaults and the control would stop
+    # being one.
+    [ "$MODE" = stock ] && { CFG=$(cfg_for_backend experiments/configs/baseline/b0b.yaml) || return 5; }
+    python -m experiments.scripts.run_ablation \
+      --config "$CFG" \
+      --set model.run.msa_subsample.source_inputs_dir="$SRC" method.label="${METHOD}_${TAG}" \
+            model.seeds=[$SEED0] $SETS $BASE \
+            $([ "$MODE" = stock ] && echo "$BASE_CTRL" || echo "$BASE_SEARCH") \
+            paths.inputs_dir="$OUT/inputs" paths.predictions_dir="$OUT/pred" \
+            paths.results_dir="$OUT/res" -v > "$OUT/run.log" 2>&1
+    local rc=$?
+    echo "    wall=$(( $(date +%s) - t0 ))s rc=$rc"
+    # health gate: refuse to score a run that failed silently
+    # PER ARM, because the two arms legitimately emit DIFFERENT counts. The steered arm is the joint
+    # pool: N + K - 1 (723 at N=720, K=4). The stock control is budget-matched as K seeds x N/K
+    # independent draws: 720. A single arm-blind number fails one of them every time -- and it would
+    # have failed the CONTROL on all 8 targets, marking healthy units unhealthy and re-running them.
+    if [ "$MODE" = stock ]; then
+      EXPECT=$(( N_SEEDS * (N_SAMPLES / SUBSAMPLE_POOL) ))
+    elif [ "$SUBSAMPLE_POOL" -gt 1 ]; then
+      EXPECT=$(( N_SAMPLES + SUBSAMPLE_POOL - 1 ))
+    else
+      EXPECT=$(( N_SEEDS * N_SAMPLES ))
+    fi
+    # NO --res-dir HERE, AND THAT IS NOT AN OVERSIGHT. `health --res-dir` requires a non-NaN DockQ
+    # column, and at THIS point in the unit nothing has scored yet -- `score_unit` runs only after
+    # this gate passes. So passing it makes the gate UNSATISFIABLE on a fresh unit: every unit fails
+    # attempt 1, returns to pending, and is only rescued on its next claim by the
+    # "fully generated but unscored" branch in the drain loop. A healthy unit is then logged
+    # "!! failed the health gate, NOT scored" over a DockQ column that could not exist yet. The pool
+    # self-heals, so no GPU work is lost, but it burns a claim cycle per unit, writes a false
+    # failure into the log, and would dead-letter a unit that hit MAX_ATTEMPTS in the wrong order.
+    # THE PARQUET CHECK BELONGS TO `unit_complete`, which already owns it via `unit_scored` and runs
+    # at the right moment, after scoring.
+    python "$STATS_DIR/tts_job_lib.py" health --log "$OUT/run.log" --pred-dir "$OUT/pred" \
+           --expect-cifs "$EXPECT"
+    local ok=$?
+    echo "    $(grep -aoE 'reward gradient (APPLIED at [0-9]+ steps \(cumulative mean\|dx\|=[0-9.]+ A\)|NEVER APPLIED)' "$OUT/run.log" | tail -1)"
+    echo "    ESS trace: $(grep -aoE 'ESS=[0-9.]+/[0-9]+' "$OUT/run.log" | tail -6 | tr '\n' ' ')"
+    [ "$TAG" = ctrl ] && [ "$(grep -ac RESAMPLE "$OUT/run.log")" -gt 0 ] && \
+      echo "    !! ctrl resampled: it is NOT a clean control"
+    if [ $ok -eq 0 ]; then
+      local S CONF SITE JAC
+      S=$(python "$STATS_DIR/tts_job_lib.py" pool-stats --cdr-map "$PROTENIX_CDR_MAP" \
+             --target "$TGT" --pred-dir "$OUT/pred")
+      # parse each axis BY NAME: a greedy .*div= would silently capture div_jac
+      CONF=$(echo "$S" | grep -oE 'div_conf=[0-9.]+' | head -1 | cut -d= -f2)
+      SITE=$(echo "$S" | grep -oE 'div_site=[0-9.]+|div_site=NA' | head -1 | cut -d= -f2)
+      JAC=$(echo "$S"  | grep -oE 'div_jac=[0-9.]+|div_jac=NA'  | head -1 | cut -d= -f2)
+      # DISTORTION GATE, against a FIXED 7.88 A ceiling, the natural pairwise paratope-RMSD maximum
+      # over an unsteered pool. A pool spread past it holds pairs more different than ANY natural
+      # pair, i.e. the fold is torn rather than diversified.
+      # DO NOT make this relative to this run's control. Natural pool spread varies about 17x
+      # across targets, so a relative limit collapses on a low-spread target and flags every
+      # steered arm.
+      # Keep it identical to the ceiling any downstream analysis applies, so the job log cannot
+      # contradict the analysis of the very rows it wrote.
+      awk -v d="${CONF:-0}" -v u="$U" 'BEGIN{
+        lim = 7.88;
+        if (d>lim) printf "    !! DISTORTED %s: div_conf=%.2f over %.2f (natural pairwise max)\n", u, d, lim;
+        else if (d>0) printf "    OK: div_conf=%.2f within %.2f (natural pairwise max)\n", d, lim }'
+      [ -n "$CONF" ] && echo "$TGT $TAG $CONF ${SITE:-NA} ${JAC:-NA}" >> "$RUN_DIR/rows.txt"
+    else
+      echo "    !! $U failed the health gate, NOT scored"
+    fi
+    grep -q "^$TGT $TAG " "$RUN_DIR/rows.txt" 2>/dev/null || \
+      echo "    !! $U produced NO ROW -- scoring failed, this arm will be invisible in RESULT.txt"
+    return $ok
+  }
+
+  score_unit () {                    # $1 = unit output dir; runs under the SCORING venv
+    local O="$1"
+    # A MISSING parquet is NOT "already scored", and returning 0 here made the two states
+    # indistinguishable to every caller. The scorer runs `evaluate --from-per-sample`, which AUGMENTS
+    # the verifier-stage parquet written during inference, with no parquet there is nothing to augment
+    # and the verifier stage cannot be re-run from these compound-id subsample dirs. So this is an
+    # unrecoverable state for the scorer and it must SAY SO rather than exit success. Returning 0
+    # instead lets the pre-exit sweep select the unit, log "sweeping N unscored unit(s)" and write
+    # nothing.
+    if [ ! -f "$O/res/per_sample.parquet" ]; then
+      echo "    !! $(basename "$O"): NO per_sample.parquet -- the verifier stage never ran or its"
+      echo "    !! output was removed. --from-per-sample cannot rebuild it; the unit must be re-run."
+      return 1
+    fi
+    # SKIP ONLY A FULLY-SCORED UNIT (.all(), not .any()). A worker killed mid-scoring leaves a
+    # PARTIALLY-filled dockq column, under .any() such a unit was skipped here forever, which
+    # silently defeated the pre-exit sweep below -- the sweep selects on .all() and then called this,
+    # so the one case it exists to repair was the one case it could not. The two tests must agree.
+    # A row DockQ can never score (missing cif) keeps the unit un-.all(), so it is re-attempted once
+    # per worker exit. That is bounded by the worker count and idempotent, unlike never scoring.
+    "$SCORE_PY" -c "
+  import pandas as pd,sys
+  d=pd.read_parquet('$O/res/per_sample.parquet')
+  sys.exit(0 if d['dockq'].notna().all() else 1)" 2>/dev/null && return 0
+    # NICE, so scoring can never delay the GPU. A unit begins with a long CPU-ONLY stretch (model
+    # construction, then featurisation) during which the card sits at 0 percent with 4 MiB resident
+    # and the pod is already CPU-saturated, with model construction alone pulling most of the
+    # cgroup for a large fraction of the unit. DockQ competing for those cores would lengthen
+    # exactly the phase the GPU is waiting on. At nice 19 the scorer only
+    # gets cycles nothing else wants, which orders it after model prep WITHOUT the worker needing to
+    # know which phase it is in. ionice too, because DockQ reads thousands of cif files off the PVC
+    # and the same argument applies to the IO the featuriser needs.
+    timeout 3600 nice -n 19 ionice -c 3 "$SCORE_PY" -m experiments.scripts.evaluate \
+      --from-per-sample --target-index "$GT_INDEX" \
+      --results-dir "$O/res" --backend "$SCORE_BACKEND" \
+      --metrics dockq --dockq-bin "$SCORE_DOCKQ" \
+      --method-label inflight > "$O/score.log" 2>&1 \
+      && echo "    [scored] $(basename "$O")" || echo "    !! scoring failed for $(basename "$O")"
+  }
+
+  # TRACK SCORER PIDs EXPLICITLY. A bare `wait` waits for EVERY background job, and the per-unit
+  # heartbeat below is an INFINITE loop -- so one heartbeat that outlives its unit blocks `wait`
+  # forever and strands the worker holding a GPU until its deadline. For the same reason
+  # `jobs -rp` overcounts the scorer cap by however many heartbeats are live. Waiting on a recorded
+  # PID list fixes both.
+  SCORERS=""
+  _reap () { local live="" p; for p in $SCORERS; do kill -0 "$p" 2>/dev/null && live="$live $p"; done; SCORERS="$live"; }
+  _n_scorers () { _reap; set -- $SCORERS; echo $#; }
+  _wait_scorers () { _reap; local p; for p in $SCORERS; do wait "$p" 2>/dev/null; done; SCORERS=""; }
+
+
+  # HOST-RAM WATCHDOG (ported verbatim from tts-b0b-pool.yaml, the proven pool template).
+  # A host-RAM OOM is an uncatchable kernel SIGKILL of the whole worker pod. This background guard
+  # watches the cgroup and, at ~MEMGUARD_PCT% of the limit, kills just the run_ablation CHILD before
+  # the kernel OOM-killer fires -- so the WORKER survives, the loop sees the unit incomplete, and it
+  # is requeued/dead-lettered like any other failure. One unit's OOM never takes down the worker.
+  # THIS MATTERS MORE SINCE AUTO-OFFLOAD WAS ENABLED: offload moves the PAE/PDE stack to HOST RAM, so
+  # the very fix that stops a GPU OOM raises the risk of a host one. (cgroup v2 memory.current/max.)
+  MEMGUARD_PCT="${MEMGUARD_PCT:-92}"
+  # HOST RAM SIZING. A big target with many diffusion samples needs a bigger memory LIMIT, not a
+  # smaller chunk: chunk changes the compute shape and can make one arm non-comparable. Raise only
+  # the limit and leave the request at 64Gi, so the scheduler still places the pod unchanged.
+  # SIZING FORMULA (models/protenix2.py, "HOST RAM FOR A STEERED RUN"):
+  #     peak_GiB ~= 22 + 1.32 * (N_token/1155)^2 * n_samples          <- STEERED runs only
+  # The plain-inference model in that same file under-predicts a steered run by ~6-7x, so do not
+  # size a steering job with it. With the confidence stage chunked the peak is 9.2 GiB at ~1155
+  # tokens, so 64Gi is ~7x headroom. A limit set too low is OOM-killed, and one set just high enough
+  # lets the memguard kill a unit mid-run, which fails the health gate and dead-letters the arm.
+  MG_FLAG=/tmp/.memguard_fired      # pod-local: set on a memguard kill so the OOM classifier can tell
+                                    # a RAM-OOM (offload would NOT help) from a GPU-OOM (escalate)
+  ( while true; do
+      cur=$(cat /sys/fs/cgroup/memory.current 2>/dev/null || echo 0)
+      max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo max)
+      # SUBTRACT RECLAIMABLE PAGE CACHE. memory.current counts the file cache, which the kernel
+      # evicts on demand and which therefore cannot cause an OOM-kill. A pod that has walked the
+      # shared volume reads memory.current at 100% of the limit while anon is near zero and
+      # inactive_file holds the rest, and the guard then kills every healthy run it claims, cycling
+      # through the whole shared queue in seconds. Any heavy file I/O does this, including the
+      # pool's own scoring, so the guard must measure the working set and not the cache.
+      inact=$(awk '/^inactive_file /{print $2}' /sys/fs/cgroup/memory.stat 2>/dev/null || echo 0)
+      cur=$(( cur > inact ? cur - inact : 0 ))
+      case "$max" in ''|max|0) sleep 5; continue;; esac
+      pct=$(( cur * 100 / max ))
+      if [ "$pct" -ge "$MEMGUARD_PCT" ]; then
+        echo "[memguard] host RAM ${pct}% >= ${MEMGUARD_PCT}% of limit -> killing run_ablation to avert a pod OOM-kill $(date -u)"
+        touch "$MG_FLAG"
+          # KILL THE TREE, NOT JUST THE PARENT. `pkill -9 -f run_ablation` reaps only the launcher
+          # and leaves its BACKEND subprocess alive, reparented to init, still holding the memory
+          # the guard fired to reclaim. Every unit the worker claims afterwards is then killed on
+          # sight. Bracket classes so these patterns never match the guard itself.
+          for _p in $(pgrep -f "[r]un_ablation" 2>/dev/null); do
+            for _c in $(pgrep -P "$_p" 2>/dev/null); do
+              for _g in $(pgrep -P "$_c" 2>/dev/null); do kill -9 "$_g" 2>/dev/null; done
+              kill -9 "$_c" 2>/dev/null
+            done
+            kill -9 "$_p" 2>/dev/null
+          done
+          # Belt and braces: a backend process only ever exists under a live run_ablation, so once
+          # none is left, anything still running is an orphan whatever its parent now reads as.
+          sleep 2
+          if ! pgrep -f "[r]un_ablation" >/dev/null 2>&1; then
+            for _o in $(pgrep -f "[_]opendde_launch|[t]orch.distributed.run|runner[.]inference" 2>/dev/null); do
+              kill -9 "$_o" 2>/dev/null
+            done
+          fi
+          sleep 15
+      fi
+      sleep 3
+    done ) &
+    MG_PID=$!   # MUST be tracked. The memguard loop above is UNBOUNDED, so a worker that has
+                # drained its queue still has a live child and never exits: it sits at 0% GPU
+                # holding the card until the job deadline.
+
+  # ---- drain the queue: claim one arm at a time, atomically ----
+  # ORPHAN RECLAIM. A worker killed mid-arm (deadline, preemption, eviction) leaves its unit in
+  # claimed/ with nobody working it. Without this the unit is lost and the grid can never drain.
+  # An arm takes ~32 min, so a claim untouched for RECLAIM_MIN is dead, not slow.
+  RECLAIM_MIN="${RECLAIM_MIN:-90}"
+  # Liveness (heartbeat rewritten every 60s) is knowable in minutes. RECLAIM_MIN stays conservative
+  # because a false reclaim is destructive, while a false "peer is alive" only defers an orphan.
+  HB_FRESH_MIN="${HB_FRESH_MIN:-5}"               # heartbeat younger than this => the claim has a live owner
+  DRAIN_IDLE_SEC="${DRAIN_IDLE_SEC:-900}"         # stop camping on a GPU after this long with nothing to do
+  reclaim () {
+    for C in $(ls "$CLAIMED" 2>/dev/null); do
+      [ -d "$CLAIMED/$C" ] || continue
+      # heartbeat is refreshed every 60s by the owning worker, so its age is true liveness.
+      # Fall back to the claim dir when no heartbeat exists (claim made by an older template).
+      _live="$HB/$C"; [ -f "$_live" ] || _live="$CLAIMED/$C"
+      if [ -z "$(find "$_live" -maxdepth 0 -mmin -"$RECLAIM_MIN" 2>/dev/null)" ]; then
+        echo "worker $WORKER_ID: reclaiming orphaned claim $C (idle > ${RECLAIM_MIN}m)"
+        mkdir -p "$PENDING/$C"; cp "$CLAIMED/$C/spec" "$PENDING/$C/spec" 2>/dev/null || true
+        rm -rf "$CLAIMED/$C"; rm -f "$HB/$C" 2>/dev/null
+      fi
+    done
+  }
+
+  # DEADLINE-AWARE CLAIMING, same guard and same spelling as tts-steer-pool.yaml. The Job carries
+  # activeDeadlineSeconds and the kubelet enforces it by killing the pod mid-unit, a unit is only
+  # written at the END of inference, so a worker cut off at the wall loses everything it was
+  # generating and the job ends Failed/DeadlineExceeded. Exiting instead frees the card and leaves
+  # the unit in pending/ for the next worker. DEADLINE_S must equal the Job's
+  # activeDeadlineSeconds, and 0 disables the check.
+  T0=$(date -u +%s)
+  DEADLINE_S="${DEADLINE_S:-0}"
+  UNIT_EST_S="${UNIT_EST_S:-16000}"
+  while :; do
+    GOT=""
+    if [ "$DEADLINE_S" -gt 0 ]; then
+      _left=$(( DEADLINE_S - ( $(date -u +%s) - T0 ) ))
+      if [ "$_left" -lt "$UNIT_EST_S" ]; then
+        echo "worker $WORKER_ID: ${_left}s left of the ${DEADLINE_S}s deadline, under the ${UNIT_EST_S}s"
+        echo "worker $WORKER_ID: a unit needs -- exiting cleanly rather than starting one that dies at the wall"
+        break
+      fi
+    fi
+    reclaim
+    # untried units first, retried ones last (requeue-at-back)
+    for U in $( { for u in $(ls "$PENDING" 2>/dev/null); do [ -f "$PENDING/$u/.retry" ] && echo "1 $u" || echo "0 $u"; done; } | sort | awk '{print $2}' ); do
+      if mkdir "$CLAIMED/$U" 2>/dev/null; then                 # atomic claim
+        cp "$PENDING/$U/spec" "$CLAIMED/$U/spec" 2>/dev/null || true
+        rm -rf "$PENDING/$U"; GOT="$U"; unset idle_since; break
+      fi
+    done
+    if [ -z "$GOT" ]; then
+      # DO NOT EXIT WHILE ANOTHER WORKER'S CLAIM IS STILL OUTSTANDING. reclaim() only fires once a
+      # claim is older than RECLAIM_MIN, so a claim left by a worker that died RECENTLY is neither
+      # reclaimable nor pending -- and a worker that treated "pending empty" as "queue drained" would
+      # walk away from it, leaving units in claimed/ with nothing running.
+      # Wait instead: sleep, then re-enter the loop so reclaim() gets its chance once the claim ages.
+      # BOUNDED DRAIN CAMP. Camping here with nothing to do holds a GPU at 0% for as long as the
+      # SLOWEST peer takes, which can idle most of a pool to the end of a run. The camp exists for a
+      # real reason (see the note above) and is NOT removed. It is bounded instead.
+      # WHY LEAVING IS SAFE. reclaim() runs at the TOP of every loop iteration for every worker, so a
+      # worker still RUNNING a unit re-enters this same loop when it finishes and reclaims any orphan
+      # then. The camp therefore only has to cover the window in which a peer might have died WITHOUT
+      # us noticing, and the heartbeat settles that in minutes: it is rewritten every 60s by the owning
+      # worker, so a claim whose heartbeat is younger than HB_FRESH_MIN provably has a live owner.
+      # NOTE THE DELIBERATE ASYMMETRY: the RECLAIM threshold stays conservative, because a false
+      # reclaim rm -rf's a live worker's predictions and double-runs the target, whereas leaving early
+      # on a wrong liveness call merely defers an orphan to the next worker that goes idle.
+      if [ "$(ls "$CLAIMED" 2>/dev/null | wc -l)" -gt 0 ]; then
+        : "${idle_since:=$(date -u +%s)}"
+        _all_live=1
+        for C in $(ls "$CLAIMED" 2>/dev/null); do
+          _live="$HB/$C"; [ -f "$_live" ] || _live="$CLAIMED/$C"
+          [ -n "$(find "$_live" -maxdepth 0 -mmin -"$HB_FRESH_MIN" 2>/dev/null)" ] || _all_live=0
+        done
+        if [ "$_all_live" = "1" ] && [ "$(( $(date -u +%s) - idle_since ))" -ge "$DRAIN_IDLE_SEC" ]; then
+          echo "worker $WORKER_ID: idle ${DRAIN_IDLE_SEC}s and all $(ls "$CLAIMED" | wc -l) outstanding claim(s) have heartbeats < ${HB_FRESH_MIN}m old (live owners), releasing the GPU"
+        else
+          echo "worker $WORKER_ID: pending empty but $(ls "$CLAIMED" | wc -l) claim(s) outstanding, waiting for reclaim"
+          sleep 300
+          continue
+        fi
+      fi
+      # SWEEP BEFORE EXIT. A unit is scored in the background right after it completes, but a worker
+      # killed mid-scoring leaves a partially-filled dockq column on a unit already retired to done/ --
+      # nothing would ever re-claim it, so it would need an external backfill. Sweeping here makes the
+      # pool self-sufficient: any done-but-unscored unit is finished off before the worker leaves.
+      swept=0
+      for U in $(ls "$DONE" 2>/dev/null); do
+        O="$RUN_DIR/$U"
+        # A MISSING parquet is the COMMONEST unscored state. A `continue` here would repair only a
+        # PARTIALLY filled parquet and silently skip every unit whose scoring never started, so a
+        # worker submitted purely to sweep them exits in seconds having scored nothing.
+        if [ -f "$O/res/per_sample.parquet" ]; then
+        "$SCORE_PY" -c "
+  import pandas as pd,sys
+  d=pd.read_parquet('$O/res/per_sample.parquet')
+  sys.exit(0 if d['dockq'].notna().all() else 1)" 2>/dev/null && continue
+        fi
+        [ "$SCORE_JOBS" -eq 0 ] && continue   # external scorer owns this unit
+        while [ "$(_n_scorers)" -ge "$SCORE_JOBS" ]; do sleep 5; done
+        score_unit "$O" & SCORERS="$SCORERS $!"; swept=$((swept+1))
+      done
+      [ "$swept" -gt 0 ] && { echo "worker $WORKER_ID: sweeping $swept unscored unit(s) before exit"; _wait_scorers; }
+      echo "worker $WORKER_ID: queue drained"; break
+    fi
+    # CHECKPOINT: retire without re-running if the structures already exist (resubmit-safe).
+    # GENERATED BUT NOT SCORED. Inference finished and the parquet did not get written, usually
+    # because the worker died during scoring. The structures are all on disk and cost hours to make,
+    # so the only thing owed is the scoring. Re-running inference here would be the single most
+    # wasteful thing the pool can do, regenerating hours of GPU time for a missing parquet. The
+    # seed-resume cannot save this case either, because
+    # with every seed complete it must keep the inputs to avoid an empty input set.
+    if ! unit_complete "$GOT" && unit_generated "$GOT"; then
+      echo "worker $WORKER_ID: $GOT fully generated but unscored -- scoring only, NOT re-running inference"
+      mv "$CLAIMED/$GOT" "$DONE/$GOT" 2>/dev/null || mkdir -p "$DONE/$GOT"
+      [ "$SCORE_JOBS" -gt 0 ] && score_unit "$RUN_DIR/$GOT" &
+      continue
+    fi
+    if unit_complete "$GOT"; then
+      echo "worker $WORKER_ID: $GOT already complete on disk -- retiring without re-running"
+      mv "$CLAIMED/$GOT" "$DONE/$GOT" 2>/dev/null || mkdir -p "$DONE/$GOT"
+      # SCORE_JOBS=0 must skip THIS call too. It is the third scoring site (the other two are the
+      # inline one and the exit sweep) and it ran unconditionally, so a deferred run still scored
+      # in-pod whenever a unit was already complete on disk.
+      [ "$SCORE_JOBS" -gt 0 ] && score_unit "$RUN_DIR/$GOT" &
+      continue
+    fi
+    ( while :; do touch "$HB/$GOT" 2>/dev/null; sleep 60; done ) &   # liveness for orphan reclaim
+    HB_PID=$!
+    mkdir -p "$Q/attempts"
+    n=$(cat "$Q/attempts/$GOT" 2>/dev/null || echo 0); n=$((n+1))
+    echo "$n" > "$Q/attempts/$GOT"
+    touch "$CLAIMED/$GOT" 2>/dev/null || true      # mark the claim live before the long run
+    if run_unit "$GOT"; then
+      kill $HB_PID 2>/dev/null; rm -f "$HB/$GOT" 2>/dev/null
+      mv "$CLAIMED/$GOT" "$DONE/$GOT" 2>/dev/null || mkdir -p "$DONE/$GOT"
+      # score this arm IN THE BACKGROUND and go straight back to the GPU. Capped so scorers cannot
+      # starve the CPU the sampler needs, `wait -n` blocks only when the cap is already reached.
+      # SCORE_JOBS=0 -> do not score here at all, go straight back to the GPU. Without the guard
+      # the loop below spins forever, because 0 >= 0 is always true. Deferring is the right
+      # setting when a CPU-only pod runs jobs/tts_job_lib.py pool-score, because in-pod scorers
+      # hold the worker well below full GPU-busy: DockQ competes with featurisation, init_model and
+      # the CPU-offloaded confidence head.
+      if [ "$SCORE_JOBS" -gt 0 ]; then
+        while [ "$(_n_scorers)" -ge "$SCORE_JOBS" ]; do sleep 5; done
+        score_unit "$RUN_DIR/$GOT" & SCORERS="$SCORERS $!"
+      fi
+    elif [ "$n" -ge "$MAX_ATTEMPTS" ]; then
+      # dead-letter: a permanently failing arm must not restart-loop and starve the pool
+      kill $HB_PID 2>/dev/null; rm -f "$HB/$GOT" 2>/dev/null   # or its heartbeat outlives the unit
+      echo "worker $WORKER_ID: $GOT dead-lettered after $n attempts"
+      mv "$CLAIMED/$GOT" "$FAILED/$GOT" 2>/dev/null || mkdir -p "$FAILED/$GOT"
+    else
+      # ESCALATE a GPU-OOM retry to forced confidence-offload, as tts-b0b-pool.yaml does: the second
+      # attempt then fits where the first did not. A HOST-RAM OOM is escalated the other way (offload
+      # RAISES host RAM), so only the GPU case sets the flag.
+      # TEST THE GPU PATTERN FIRST. `torch.OutOfMemoryError` CONTAINS the substring `MemoryError`,
+      # so a host-RAM test listing MemoryError first matches every GPU OOM and misclassifies it as
+      # kind="ram", which never gets the forced-offload flag and retries into the identical OOM.
+      # ONE CLASSIFIER, IN tts_job_lib.py, NOT A COPY OF AN if/elif CHAIN PER TEMPLATE. The two
+      # ordering traps -- memguard before the GPU test, and the GPU test before the host test
+      # because `torch.OutOfMemoryError` CONTAINS `MemoryError` -- live there beside the reasoning
+      # that justifies them, so they cannot drift between templates.
+      _oomk=$(python "$STATS_DIR/tts_job_lib.py" oom-class --log "$RUN_DIR/$GOT/run.log" \
+                     --memguard-flag "$MG_FLAG" 2>/dev/null | head -1)
+      case "$_oomk" in
+        gpu_size)
+          # THE UNIT GENUINELY DID NOT FIT: escalate to forced confidence-offload, as
+          # tts-b0b-pool.yaml does, so the second attempt fits where the first did not.
+          touch "$FORCE/$GOT"
+          echo "worker $WORKER_ID: $GOT hit a GPU OOM (too big) -- retry WITH forced confidence-offload"
+          printf '{"unit":"%s","kind":"gpu_size","attempt":%s}\n' "$GOT" "$n" >> "$OOMLOG" ;;
+        gpu_contention)
+          # THE CARD WAS OCCUPIED. That is a SCHEDULING fault, not a size fault, and forcing
+          # offload would slow every future attempt at this unit for a reason that was never true:
+          # the same unit fits comfortably once it has a card to itself. Clear any stale flag and
+          # requeue for a free GPU.
+          rm -f "$FORCE/$GOT" 2>/dev/null
+          echo "worker $WORKER_ID: $GOT hit a GPU OOM caused by CONTENTION, not size -- NOT forcing offload"
+          python "$STATS_DIR/tts_job_lib.py" oom-class --log "$RUN_DIR/$GOT/run.log" \
+                 --memguard-flag "$MG_FLAG" 2>/dev/null | tail -1
+          printf '{"unit":"%s","kind":"gpu_contention","attempt":%s}\n' "$GOT" "$n" >> "$OOMLOG" ;;
+        ram)
+          # offload RAISES host RAM, so forcing it would make the retry fail identically.
+          rm -f "$FORCE/$GOT" 2>/dev/null
+          echo "worker $WORKER_ID: $GOT hit a HOST-RAM OOM -- retry WITHOUT force-offload"
+          printf '{"unit":"%s","kind":"ram","attempt":%s}\n' "$GOT" "$n" >> "$OOMLOG" ;;
+      esac
+      kill $HB_PID 2>/dev/null; rm -f "$HB/$GOT" 2>/dev/null
+      echo "worker $WORKER_ID: $GOT failed (attempt $n), returning to pending"
+      mkdir -p "$PENDING/$GOT"; cp "$CLAIMED/$GOT/spec" "$PENDING/$GOT/spec" 2>/dev/null || true
+      touch "$PENDING/$GOT/.retry"      # sorted last by the claim loop, so it goes to the BACK
+      rm -rf "$CLAIMED/$GOT"
+    fi
+  done
+
+  # ---- ground-truth metrics are already done: every unit is DockQ-scored concurrently the moment it
+  #      completes (score_unit, under the SCORING venv because DockQ's Cython extension is built
+  #      against numpy<2 and silently returns None under the inference venv), and any unit left
+  #      partially scored is finished off by the pre-exit sweep above. No external backfill is
+  #      needed, and one invoked behind a `|| echo skipped` guard would print a reassuring line and
+  #      do nothing.
+  if [ "$WORKER_ID" = "0" ]; then
+    sort "$RUN_DIR/rows.txt" 2>/dev/null | tee "$RUN_DIR/RESULT.txt"
+  fi
+  # a worker that exits mid-scoring would leave that arm unscored until someone re-runs a backfill
+  echo "worker $WORKER_ID: waiting for $(_n_scorers) in-flight scorer(s)"
+  _wait_scorers
+  kill $HB_PID 2>/dev/null                      # belt and braces: nothing may outlive the worker
+      kill "${MG_PID:-0}" 2>/dev/null || true       # stop the unbounded memguard, or the worker hangs here
+  echo "worker $WORKER_ID exit $(date -u): done=$(ls "$DONE" | wc -l) failed=$(ls "$FAILED" | wc -l)"
+  # EXIT EXPLICITLY. Without this the shell runs off the end of the command_script body straight
+  # into the cluster-wiring YAML below and tries to execute `job_name:`, `nvidia.com/gpu:`,
+  # `tolerations:` and the rest, dying with exit 127. Every worker then reports Failed AFTER
+  # draining its queue successfully. Nothing is lost, but the exit code becomes useless, because a
+  # clean drain and a real crash are indistinguishable.
+  exit 0
+
+# ---- cluster wiring (fill in for your cluster; values below are PLACEHOLDERS) ----
+job_name: tts-cast-pool
+
+resourcing:
+  cpu: 8                 # REQUEST 8 per 1 GPU, with the limit at 12 below. `requests` is a
+                         # scheduling RESERVATION, `limits` is the throughput cap. Inference bursts
+                         # to about 11 cores and the limit of 12 already covers that, so raising the
+                         # REQUEST buys no speed. It only reserves more of the queue flavour's
+                         # bundled CPU, which is bundled per GPU, so a bigger request consumes CPU
+                         # other users need to admit their own GPU jobs.
+  memory: 64Gi           # peak host RSS is 9.2 GiB at the worst case (1155 tokens, 50 samples,
+                         # confidence chunk 5, CPU-offload active), and host RAM is FLAT in sample
+                         # count once the confidence stage is chunked, so TOKEN count is what moves
+                         # it. This is ~7x that peak for a 1-GPU pod and ~1.7x for a 4-GPU one, one
+                         # inference per GPU. Above 128 samples the offload rail fires and the
+                         # retained-sample stack grows, so raise it for such a pool.
+  nvidia.com/gpu: 1      # ONE GPU per worker; parallelism = how many workers you submit
+
+# PIN THE GPU MODEL. Without a selector the scheduler hands over whatever card is free, and the
+# card decides the on-GPU token ceiling (models/protenix2.py `_MAX_ONGPU_TOKENS_BY_CARD`):
+# ~800 tokens on a 40 GB card, ~950 on an 80 GB one. An unpinned submission tends to land on the
+# smaller card, and every target in the 770-1155 token band then CUDA-OOMs and has to be requeued
+# with forced offload. Pin the larger card for any target set above ~800 tokens, or accept the
+# offload, which fits but is slower.
+# Some clusters also TAINT the large-memory nodes, in which case a matching toleration is required
+# as well or the selector can never be satisfied.
+node_selector: '<YOUR-GPU-PRODUCT-LABEL>'    # e.g. nvidia.com/gpu.product: <A100-80GB product name>
+tolerations: []                              # add the taint your large-GPU nodes carry, if any
+
+namespace: '<YOUR-NAMESPACE>'
+image: '<YOUR-PROTENIX-IMAGE>'
+
+additional_volumes:
+  - name: work
+    mount_path: /workspace
+    claim_name: '<YOUR-PVC-CLAIM>'
+    read_only: False
+
+git_repo: null
+git_commit: null

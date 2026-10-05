@@ -1,0 +1,89 @@
+# Shared defaults. Every cell config includes / overrides these blocks.
+# Paths are resolved relative to the *config file's directory* (see config.load_config).
+
+paths:
+  # base.yaml lives at protenix/experiments/configs/, ../../../ climbs to protenix/
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/${method.label}
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/${method.label}
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+
+# --------------------------------------------------------------- model backend
+# Every ablation dispatches through this block. Swapping ``backend`` swaps the
+# underlying co-folding model without touching any method / experiment code.
+model:
+  backend: protenix2             # currently only backend shipped; add more under models/
+  # ONE unified axis pair for the whole sampling family (B0 / BoN / A1.*):
+  #   trunk   = MSA resampling (msa_subsample below): seed = one MSA subsample.
+  #   diffusion = n_samples_per_seed: sample = one diffusion draw per seed.
+  # Each experiment is just different hyperparameters here, no per-method code.
+  # See models/base.py "SEED vs SAMPLE".
+  seeds: [101]                   # base diffusion-RNG seed (single value; MSA seeds are separate)
+  run:
+    n_cycles: 10                 # upstream default. → Protenix ``model.N_cycle``, Boltz ``recycling_steps`` …
+    n_samples_per_seed: 5        # upstream default: diffusion samples/seed. → Protenix ``sample_diffusion.N_sample``
+    n_diffusion_steps: 200       # → Protenix ``sample_diffusion.N_step`` (denoising steps/sample) …
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    # Trunk axis. Every cell picks its own MSA-resampling hyperparameters here.
+    #   policy: none ⇒ subsampling OFF: each seed uses the FULL MSA and n_seeds
+    #     becomes diffusion-RNG scaling (Xinheng-style seed-scaling).
+    #   otherwise ⇒ emit n_seeds subsampled inputs (each = one coherent multi-chain
+    #     subsample at `depth`), the diffusion RNG is held to one value.
+    # B0 = (n_seeds 1) x (1 sample). BoN = A1.a = (n_seeds 1) x (N samples).
+    # A1.b sweeps depth, A1.c/.d sweep policy, A1.e/.f sweep n_seeds.
+    # Requires MSA-wired inputs (unpairedMsaPath), see method.trunk_side.wire_msa_from_dump.
+    msa_subsample:
+      policy: random             # random | cluster | none (=full MSA)
+      depth: 1000                # rows kept per chain (working depth)
+      n_seeds: 1                 # number of MSA subsamples = trunk seeds
+      seed: 0                    # base subsample RNG; subsample i uses seed+i
+      identity_threshold: 0.9    # policy=cluster only
+      chain_filter: null         # e.g. ["H"] to subsample only specific chains
+      source_inputs_dir: null    # optional MSA-wired base inputs (default: paths.inputs_dir)
+  # Backend-specific config lives under a subkey named after the backend.
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    enable_tf32: true
+    enable_efficient_fusion: true
+    need_atom_confidence: false
+    # Kernel selection for toolkit-less GPU nodes (only torch's bundled CUDA
+    # runtime, no nvcc/CUDA_HOME, e.g. a plain python image). Leave null on
+    # nodes with a full CUDA toolkit to use Protenix's faster fused kernels.
+    triangle_kernel: ${env:PROTENIX_TRIANGLE_KERNEL,""}   # e.g. "torch"
+    layernorm_type:  ${env:PROTENIX_LAYERNORM_TYPE,""}    # e.g. "torch" (skips FusedLayerNorm JIT)
+    # Checkpoint resolution: prefer the private-tuned Protenix-V2, fall back to the
+    # PUBLIC ByteDance weights when the private source is unreachable (e.g. running
+    # off-network). Resolved at run() time, the choice is logged + stored in
+    # run_record.json["model_source"]. See models/protenix_provision.py.
+    checkpoint:
+      prefer_private: true                # try the private checkpoint first
+      allow_public_fallback: true    # else use public weights (set false to require the private source)
+      private_model_name: protenix-v2
+      private_root_dir: ${env:PROTENIX_ROOT_DIR}
+      # SAME ARCHITECTURE AS private_model_name. A public FALLBACK may change the weights' provenance.
+      # it must never change the model. The old default named the MINI variant, so prefer_private=false
+      # silently produced results incomparable with every private-checkpoint arm.
+      public_model_name: ${env:PROTENIX_PUBLIC_MODEL,protenix-v2}
+      public_root_dir: ${env:PROTENIX_PUBLIC_ROOT_DIR,""}   # empty → package default cache
+
+verifier:
+  # Default Best-of-N selection verifier. Alternates kept configurable and
+  # used for the verifier-swap sensitivity in §6.
+  rank_by: ranking_score             # {ipsae | ranking_score | iptm | plddt | ptm} (model's 0.8*ipTM + 0.2*pTM)
+  ipsae:
+    pae_cutoff_A: 10.0
+    dist_cutoff_A: 10.0
+    plddt_cutoff: 0.0                # 0 = no pLDDT filter
+    fallback_rank_by: ranking_score
+
+metrics:
+  dockq: { bin: null }
+  ost:   { bin: null }
+  tm:    { bin: null }
+  diversity: { cluster_threshold_A: 2.0 }
+
+# `method` is filled in per-cell config

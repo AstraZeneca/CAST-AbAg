@@ -1,0 +1,219 @@
+# TTS B0.b Best-of-N grid (20 MSA-subsample seeds x 50 diffusion samples), on the collected
+# antibody-antigen bad cases. 4-GPU single-pass job, cluster-agnostic template.
+#
+# B0.b = the test-time-scaling grid behind Figures 1, 2 and 5 (Best-of-N over seeds x samples).
+#   trunk-side  : MSA random subsample, depth = MSA_DEPTH (default 32), seeds = 20
+#   diffusion   : N_SAMPLES samples per seed (default 50), eval subsets {1,5,10,50}
+# Everything (subsample policy/depth/seeds, sample count) comes from
+# experiments/configs/baseline/b0b.yaml, overridden only by env vars here, so the same job serves
+# depth 32 (figures) and depth 1000 (rerun).
+#
+# DATA: the collected bad-case set (data/datasets/collected_bad_cases.py) yields SEQUENCES only
+# (parsed from each {tid}.pdb SEQRES) with no MSA, so inputs are WIRED against a pre-built
+# colabfold MSA DB before inference (Step 2). model.run.msa_subsample then resamples FROM those.
+#
+# LARGE TARGETS: the two largest targets (9j4c, 9nrc) overflow GPU memory in the confidence PAE
+# stack at high sample counts. This is handled automatically by the memory model in
+# models.protenix2: PROTENIX_CONF_OFFLOAD_TOKENS=auto offloads the confidence PAE/PDE to CPU only
+# for the targets that would otherwise OOM, and PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE=auto sizes
+# the diffusion chunk to the detected GPU. So all 52 targets finish in one pass on any card size
+# (no manual chunk/offload tuning, no separate gap-fill job). Requests generous host RAM because
+# the offloaded PAE tensors live on CPU. On a busy cluster that grants GPUs one at a time, a
+# fixed partition over targets is the alternative shape.
+#
+# Pipeline: prepare collected_bad_cases -> wire MSAs from DB -> Protenix inference (auto memory)
+# -> verifier scoring (Best-of-N ranked by ranking_score, full PAE panel kept per sample) ->
+# per_sample.parquet + per_target.csv, then ab-antigen DockQ + seeds x samples summary.
+# Companion of the b0 variant (B0 single sample) and the depth-sweep variant (depth x policy).
+#
+# CHECKPOINTING / RESUME: inference skips any target that already has its full n_seeds*n_samples
+# cifs on disk, so re-submitting after a crash/preemption resumes where it left off (no GPU work
+# repeated) and rebuilds the full parquet via run_ablation --skip-inference. Safe to resubmit, the
+# job exits non-zero until all 52 targets are complete. (Set N_SEEDS to msa_subsample.n_seeds.)
+#
+# CLUSTER-AGNOSTIC: everything cluster-specific is an env var or a <PLACEHOLDER> below. Fill in the
+# image, volume/claim, namespace and resourcing for your cluster; the command_script has no
+# hard-coded paths (all via env with sensible relative defaults). For a concrete cluster example
+# see the containerised variant.
+
+command_script: |
+  set -e
+
+  # ---- code (adapt or replace with your own checkout/mount) ----
+  REPO_ROOT="${REPO_ROOT:-$PWD}"                 # dir containing the Protein-TTS package
+  cd "$REPO_ROOT"
+
+  # ---- job parameters (override per run) ----
+  export RUN_DIR="${RUN_DIR:-./runs/b0b}"                                        # output root
+  export BAD_CASES_DIR="${BAD_CASES_DIR:-./data/collected_bad_cases/bad_cases}"  # 52 {tid}/{tid}.pdb dirs
+  export MSA_DB="${MSA_DB:-./data/msa_db/collected_bad_cases}"                   # pre-built colabfold MSA DB
+  TTS_CONFIG="${TTS_CONFIG:-experiments/configs/baseline/b0b.yaml}"
+  BACKEND="${BACKEND:-protenix2}"
+  # Protenix defaults $LAYERNORM_TYPE to "fast_layernorm", a CUDA extension needing nvcc and
+  # ninja. torch is the default here so this matches the pool templates and the measured arms.
+  # Set LAYERNORM_TYPE=fast_layernorm for the faster kernel.
+  export LAYERNORM_TYPE="${LAYERNORM_TYPE:-torch}"
+  NPROC_PER_NODE="${NPROC_PER_NODE:-4}"          # GPUs for this job
+  MSA_DEPTH="${MSA_DEPTH:-1000}"   # d=1000 is the depth every reported B0.b result uses
+  N_SAMPLES="${N_SAMPLES:-50}"                    # diffusion samples per seed
+  RANK_BY="${RANK_BY:-ranking_score}"             # verifier for the summary grid (matches config verifier.rank_by + the figures)
+
+  # ---- auto memory management (any card size, no manual tuning) ----
+  export PROTENIX_CONF_OFFLOAD_TOKENS="${PROTENIX_CONF_OFFLOAD_TOKENS:-auto}"     # offload only targets that would OOM
+  export PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE="${PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE:-auto}"
+  # Per-card on-GPU token ceiling (above it -> offload). Tunable per run, the runtime reads the one
+  # matching its DETECTED card. Lower them on a cluster whose card has less FREE memory than nominal.
+  export PROTENIX_MAX_ONGPU_TOKENS_40G="${PROTENIX_MAX_ONGPU_TOKENS_40G:-750}"   # ceiling on a 40GB
+                                                                                 # card. 750 not 800
+                                                                                 # because the model
+                                                                                 # is optimistic by
+                                                                                 # 5-7 GiB near the
+                                                                                 # top of the card
+  export PROTENIX_MAX_ONGPU_TOKENS_80G="${PROTENIX_MAX_ONGPU_TOKENS_80G:-950}"    # ceiling on an 80GB card
+  export PROTENIX_OOM_SKIP="${PROTENIX_OOM_SKIP:-1}"                            # on a GPU OOM: log the target + skip its remaining seeds (move to next target)
+  export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+  INFER_CHUNK_SIZE="${INFER_CHUNK_SIZE:-128}"     # forced attention chunk (trunk + confidence head)
+
+  # ---- environment ---- (full note in tts-b0b-pool.yaml)
+  export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+  # ---- CHECKPOINT ROUTE: PRIVATE IMAGE CACHE FIRST, PUBLIC WEIGHTS AS THE FALLBACK ----
+  # The image ships the private checkpoint under a baked cache, so that is the DEFAULT here and the
+  # variable only overrides it. A machine without that cache resolves to public weights instead, which
+  # are the same architecture (public_model_name is protenix-v2, never the mini), so a fallback changes
+  # the weights' provenance and not the model.
+  export PROTENIX_ROOT_DIR="${PROTENIX_ROOT_DIR:-${APP_ROOT:-/opt/cofold}/protenix/cache}"
+  # The public cache. Unset means "the package default", a different directory per image that cannot be
+  # pre-seeded or checked. Defaults to the private root so one cache serves both branches.
+  export PROTENIX_PUBLIC_ROOT_DIR="${PROTENIX_PUBLIC_ROOT_DIR:-$PROTENIX_ROOT_DIR}"
+  # THERE IS NO DOWNLOAD BRANCH. Full note in tts-b0b-pool.yaml.
+  # Say which route WON before the GPU starts, rather than leaving it in a run log 20 minutes in.
+  python "$REPO_ROOT/jobs/tts_job_lib.py" checkpoint-route --code-tree "$REPO_ROOT" || true
+  nvidia-smi -L || true
+  # ---- REFUSE TO START ON AN OCCUPIED CARD ---- (full note in tts-cast-pool.yaml)
+  _gpu_idx="${CUDA_VISIBLE_DEVICES:-}"; _gpu_idx="${_gpu_idx%%,*}"
+  case "${_gpu_idx:-}" in
+    "")       echo "[startup] occupied-card check skipped (no CUDA_VISIBLE_DEVICES)" ;;
+    *[!0-9]*) echo "[startup] occupied-card check skipped ($_gpu_idx is not a device index)" ;;
+    *)
+      _busy=$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null \
+              | awk -F', *' -v i="$_gpu_idx" '$1 == i {print $2}')
+      if [ -n "${_busy:-}" ] && [ "$_busy" -gt "$(( ${GPU_BUSY_GIB:-8} * 1024 ))" ]; then
+        echo "!! GPU $_gpu_idx already holds ${_busy} MiB, over the ${GPU_BUSY_GIB:-8} GiB start bar."
+        echo "!! On a multi-GPU pod EVERY worker needs its OWN device. Two workers on one card is"
+        echo "!! how a unit is lost to a fake size-OOM. Give this worker a free index, or raise"
+        echo "!! GPU_BUSY_GIB to share on purpose."
+        exit 5
+      fi
+      echo "[startup] GPU $_gpu_idx holds ${_busy:-0} MiB before this worker starts" ;;
+  esac
+  echo "NPROC=$NPROC_PER_NODE  MSA_DEPTH=$MSA_DEPTH  N_SAMPLES=$N_SAMPLES  OFFLOAD=$PROTENIX_CONF_OFFLOAD_TOKENS  CHUNK=$PROTENIX_SAMPLE_DIFFUSION_CHUNK_SIZE"
+
+  echo "=== Step 1: prepare foldbench bad-case inputs (sequences from {tid}.pdb SEQRES) ==="
+  python -m experiments.scripts.prepare_dataset \
+    --dataset collected_bad_cases \
+    --dataset-args "{\"bad_cases_dir\": \"$BAD_CASES_DIR\"}" \
+    --backend "$BACKEND" \
+    --out-dir "$RUN_DIR/inputs" \
+    --index-csv "$RUN_DIR/target_index.csv"
+
+  echo "=== Step 2: wire full MSAs onto the inputs from the pre-built DB ==="
+  # collected_bad_cases carries no MSA, attach unpairedMsaPath entries from $MSA_DB/{tid}.
+  # model.run.msa_subsample (policy=random, depth=$MSA_DEPTH) then resamples FROM these.
+  # (shared logic in jobs/tts_job_lib.py, identical across all tts-b0b* templates)
+  python "$REPO_ROOT/jobs/tts_job_lib.py" wire-msas --run-dir "$RUN_DIR" --msa-db "$MSA_DB"
+
+  # === Checkpoint: (re)run only targets not already complete (resume on resubmit) ===
+  # A target is COMPLETE only with n_seeds*n_samples cif AND matching pae-npz (see jobs/tts_job_lib.py
+  # -- npz alone can be missing after an interrupt between the structure and confidence dumps, and
+  # scoring needs it). RESUBMIT after a crash: finished targets are skipped, only the rest re-run.
+  N_SEEDS="${N_SEEDS:-20}"                         # MUST match the config's msa_subsample.n_seeds
+  EXP_CIF=$(( N_SEEDS * N_SAMPLES ))
+  TODO="$RUN_DIR/inputs_todo"; rm -rf "$TODO"
+  python "$REPO_ROOT/jobs/tts_job_lib.py" checkpoint \
+    --wired-dir "$RUN_DIR/inputs_wired" --pred-dir "$RUN_DIR/predictions" --todo-dir "$TODO" \
+    --n-seeds "$N_SEEDS" --n-samples "$N_SAMPLES"
+  n_todo=$(ls "$TODO"/*.json 2>/dev/null | wc -l)
+  n_done=$(( $(ls "$RUN_DIR"/inputs_wired/*.json 2>/dev/null | wc -l) - n_todo ))
+
+  echo "=== Step 3: B0.b inference on incomplete targets (nproc=$NPROC_PER_NODE, auto chunk+offload) ==="
+  # data-parallel over (target, seed), auto chunk+offload keeps every target, incl. the two largest,
+  # on one pass. infer_chunk_size forces the attention tile on the trunk + confidence head.
+  if [ "$n_todo" -gt 0 ]; then
+    python -m experiments.scripts.run_ablation \
+      --config "$TTS_CONFIG" \
+      --set "model.backend=$BACKEND" \
+      --set "model.run.msa_subsample.source_inputs_dir=$TODO" \
+      --set "model.run.msa_subsample.depth=$MSA_DEPTH" \
+      --set "model.run.msa_subsample.n_seeds=$N_SEEDS" \
+      --set "model.run.n_samples_per_seed=$N_SAMPLES" \
+      --set "model.protenix2.infer_chunk_size=$INFER_CHUNK_SIZE" \
+      --set "model.protenix2.dynamic_chunk_size=false" \
+      --set "paths.inputs_dir=$RUN_DIR/inputs_wired" \
+      --set "paths.predictions_dir=$RUN_DIR/predictions" \
+      --set "paths.results_dir=$RUN_DIR/results" \
+      --set "model.run.nproc_per_node=$NPROC_PER_NODE"
+  fi
+
+  # On a resume (some targets were already complete), re-score ALL 52 from existing cifs via
+  # --skip-inference (CPU, no GPU) so the parquet covers every target, not just the reruns.
+  if [ "$n_done" -gt 0 ]; then
+    echo "=== Step 3b: score-all pass (resume), full parquet from every cif, no inference ==="
+    python -m experiments.scripts.run_ablation --skip-inference \
+      --config "$TTS_CONFIG" \
+      --set "model.backend=$BACKEND" \
+      --set "model.run.msa_subsample.source_inputs_dir=$RUN_DIR/inputs_wired" \
+      --set "model.run.msa_subsample.depth=$MSA_DEPTH" \
+      --set "model.run.msa_subsample.n_seeds=$N_SEEDS" \
+      --set "model.run.n_samples_per_seed=$N_SAMPLES" \
+      --set "paths.inputs_dir=$RUN_DIR/inputs_wired" \
+      --set "paths.predictions_dir=$RUN_DIR/predictions" \
+      --set "paths.results_dir=$RUN_DIR/results" \
+      --set "model.run.nproc_per_node=$NPROC_PER_NODE"
+  fi
+
+  echo "=== Step 4: ab-antigen DockQ + seeds x samples rank/oracle summary ==="
+  # --from-per-sample augments the parquet run_ablation wrote. DockQ is cached per sample.
+  python -m experiments.scripts.evaluate --from-per-sample \
+    --results-dir     "$RUN_DIR/results" \
+    --target-index    "$RUN_DIR/target_index.csv" \
+    --backend         "$BACKEND" --rank-by "$RANK_BY" \
+    ${DOCKQ_BIN:+--dockq-bin $DOCKQ_BIN} \
+    --summary \
+    --summary-seed-subsets 1,5,10,20 --summary-sample-subsets 1,5,10,50
+
+  # Completeness: how many of the 52 targets reached the full n_seeds*n_samples row count. If < 52,
+  # the checkpoint above lets a resubmit finish the rest (exit non-zero so the scheduler flags it).
+  n_full=$(python "$REPO_ROOT/jobs/tts_job_lib.py" count-complete --parquet "$RUN_DIR/results/per_sample.parquet" --exp "$EXP_CIF")
+  echo "TTS B0.b: $n_full/52 targets complete"
+  ls -lh "$RUN_DIR/results/per_sample.parquet" "$RUN_DIR/results/per_target.csv"
+  [ "$n_full" = "52" ] || { echo "INCOMPLETE ($n_full/52) - resubmit to resume the rest"; exit 1; }
+
+# ---- cluster wiring (fill in for your cluster; values below are PLACEHOLDERS) ----
+job_name: tts-b0b
+
+resourcing:
+  cpu: 32
+  memory: 64Gi           # peak host RSS is 9.2 GiB at the worst case (1155 tokens, 50 samples,
+                         # confidence chunk 5, CPU-offload active), and host RAM is FLAT in sample
+                         # count once the confidence stage is chunked, so TOKEN count is what moves
+                         # it. This is ~7x that peak for a 1-GPU pod and ~1.7x for a 4-GPU one, one
+                         # inference per GPU. Above 128 samples the offload rail fires and the
+                         # retained-sample stack grows, so raise it for such a pool.
+  nvidia.com/gpu: 4
+
+# PIN THE GPU MODEL. Full note in tts-cast-pool.yaml.
+node_selector: '<YOUR-GPU-PRODUCT-LABEL>'    # label key is cluster-specific (e.g. nvidia.com/gpu.product, or accelerator)
+tolerations: []                              # add the taint your large-GPU nodes carry, if any
+
+namespace: '<YOUR-NAMESPACE>'
+image: '<YOUR-PROTENIX-IMAGE>'
+
+additional_volumes:
+  - name: work
+    mount_path: /workspace
+    claim_name: '<YOUR-PVC-CLAIM>'
+    read_only: False
+
+git_repo: null
+git_commit: null
+ignore_git: True

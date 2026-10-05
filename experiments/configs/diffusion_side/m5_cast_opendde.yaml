@@ -1,0 +1,158 @@
+# CAST on the OpenDDE backend -- the joint cross-subsample pool driving a SECOND co-folding model.
+#
+# The `method` block is copied from m5_cast.yaml UNCHANGED so both backends are steered identically.
+# The long derivation for every knob lives there and is deliberately not duplicated: if m5_cast.yaml
+# recalibrates, recalibrate here too. The scale 75 / rms-clip 6 pairing and the umbrella set are a
+# MATCHED calibration, never independent knobs. Only the `model` block differs, and it is copied from
+# m2_tds_opendde.yaml except for n_seeds, which K forces.
+#
+# PUBLIC SOURCE. OpenDDE is https://github.com/aurekaresearch/OpenDDE (Apache-2.0), installed from
+# PyPI as `pip install "opendde[gpu]==1.1.0"` with weights from
+# https://huggingface.co/aurekaresearch/OpenDDE (opendde_abag.pt, the antibody-antigen checkpoint).
+# OPENDDE_ROOT_DIR points at the tree holding .venv, checkpoint/ and common/. models/opendde.py
+# carries the full staging recipe. Pin the version: upstream is a preview release and a moved attach point
+# leaves the run UNSTEERED rather than failing.
+#
+# WHY THE JOINT POOL WORKS HERE AT ALL. The pool is not backend code: it lives in the shared hook
+# (protenix_hooks.py, gated on spec.subsample_pool > 1) and operates only on the conditioning tensors
+# the hook is already handed, so it has no Protenix-specific attach point. models/opendde.py routes
+# every run through models/_opendde_launch.py, which calls apply_standard_hooks() inside the OpenDDE
+# venv -- the same one sequence both backends use.
+#
+# nproc_per_node MUST BE 1 and the code now enforces it from two sides: the shared hook refuses a
+# joint pool at WORLD_SIZE > 1 (the K conditionings would be dealt across ranks by DistributedSampler
+# and the deferred diffusion would never fire), and models/opendde.py refuses a steered run at
+# nproc > 1 outright, because its multi-GPU path execs runner.batch_inference and never loads the
+# hooks at all. Two GPUs therefore means two independent runs, not one wider one.
+#
+# The hook is verified at the GRADIENT level on OpenDDE, not merely attached: a steered run logs
+# "reward gradient APPLIED at N steps" with a non-zero cumulative displacement where the matching
+# Best-of-N run logs none, so the tilt moves an OpenDDE sample the way it moves a Protenix one.
+# The joint pool is verified on OpenDDE too: the run logs "K conditionings in ONE diffusion of N
+# particles" and writes exactly N + K - 1 structures.
+
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m5_cast_opendde
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m5_cast_opendde
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+
+model:
+  backend: opendde
+  seeds: [101]
+  run:
+    n_cycles: 10
+    # N PARTICLES IN THE SHARED POOL, not per latent. 720 = 60 cells x 12, and at K=4 the latent
+    # allocation is an even [180,180,180,180]. Below ~360 per seed check_cell_budget errors with
+    # "cell(s) end up with NO tilted particle" and the run completes anyway, having silently
+    # explored fewer binding hypotheses than the sweep asked for. 780 is the project ceiling.
+    # The emitted count is N + K - 1 = 723, NOT n_seeds * n_samples_per_seed: the K conditionings
+    # share ONE diffusion and each deferred entry returns a single placeholder. Size any completion
+    # check on 723. models/opendde.py now computes this itself for its own log line.
+    n_samples_per_seed: 720
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1                   # mandatory, see the header
+    msa_subsample:
+      policy: random
+      depth: 1000
+      n_seeds: 4                        # MUST equal method.diffusion_search.subsample_pool.
+                                        # run_ablation DERIVES this from subsample_pool when K>1
+                                        # (they live in different config namespaces, so the spec's
+                                        # __post_init__ cannot see both), the pool template derives
+                                        # it too. Set K, not this.
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  opendde:
+    model_name: opendde_v1
+    root_dir: ${env:OPENDDE_ROOT_DIR}
+    abag: true
+    executable: ${env:OPENDDE_BIN,opendde}
+    # venv_python is DERIVED from executable (<venv>/bin/opendde -> <venv>/bin/python), set it here
+    # only if that venv puts its interpreter somewhere else.
+    venv_python: ${env:OPENDDE_PYTHON,""}
+    need_atom_confidence: true         # PAE gate, without it ipSAE/pDockQ2/LIS/iLIS score nothing
+    trimul_kernel: auto                # NEVER 'torch': 40.55 GiB alloc / OOM vs 19.7 GiB on auto
+    triatt_kernel: auto
+    enable_tf32: true
+    enable_fusion: true
+    enable_cache: true
+
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+
+method:
+  # FAMILY, not the method name: run_ablation accepts only
+  #   best_of_n | search | guidance | interaction
+  # and RAISES on anything else. CAST is registered under `guidance` (DIFFUSION_FAMILIES).
+  diffusion_side: guidance
+  label: m5_cast_opendde
+  diffusion_search:
+    algorithm: cast
+
+    # ---- reward -------------------------------------------------------------------------------
+    # MANDATORY AT subsample_pool>1 and NOT interchangeable with site_contact: tts_job_lib.py:452
+    # rejects any reward but `epitope` for a joint pool. site_contact at contact_weight=0.0 is
+    # bit-identical, but the guard tests the NAME. Do not "simplify" it back.
+    reward: epitope
+    rmsd_subset: paratope
+    sweep_units: centroid_A
+    epitope_map_builder: hybrid_modes_tiles   # PINNED: tts_job_lib.py:405 refuses a disagreeing map
+    epitope_source: predicted     # ABLATION KNOB: `ground_truth` is the oracle bound. Set it on the
+                                  # COMMAND LINE, not here, or this stops being the deployable number.
+    site_hinge: true
+    site_huber_delta: 4.0
+    contact_weight: 0.0           # INERT under reward=epitope, which has no contact term to weight
+    clash_enabled: false
+    site_softmin_tau: 0.0
+    site_dev_cap: 0.0
+    site_floor: 0.0
+
+    # ---- stratification -----------------------------------------------------------------------
+    umbrella_sweep: "9,11,13,15"  # brackets the 9.58-15.60 A native paratope-epitope range;
+                                  # 4 umbrellas x 15 sites = 60 cells, 12 particles each at N=720
+
+    # ---- the joint pool -----------------------------------------------------------------------
+    subsample_pool: 4             # THE DEFINING KNOB. 1 turns CAST into plain tds, i.e. the separate
+                                  # model, which is m2_tds_opendde.yaml. The pool is fixed at N, so
+                                  # raising K thins particles per subsample per cell.
+    weight_level_correction: true # required at K>1: `difference` telescopes to lam*(r_T - r_0),
+                                  # dividing out the r_0 that marks a well-placed trunk. Auto-forced
+                                  # False at subsample_pool <= 1 by DiffusionSearchSpec.__post_init__.
+
+    # ---- SMC ----------------------------------------------------------------------------------
+    potential: difference
+    lam_adaptive: true
+    lam: 4.0                      # NOT inert: it CAPS the solved lambda, min(lam, lambda_for_ess).
+                                  # The solved lambda is around 0.01, so the cap does not bind.
+    target_ess_frac: 0.4
+    resample: ess
+    ess_fraction: 0.5
+    resample_scheme: systematic
+
+    # ---- the selection window -----------------------------------------------------------------
+    # BOTH KEYS MOVE TOGETHER. At schedule_every=20 over 200 steps, start_frac 0.25 puts scoring
+    # events at 50/70/90/... and this window admits 50 and 70, so exactly 2 resamples fire. Set
+    # start_frac to 0.5 and the events move to 100-180, DISJOINT from the window: zero resamples
+    # fire and the run degrades to transport-only while logging normally.
+    resample_windows: "0.25:0.35"
+    schedule_start_frac: 0.25
+    schedule_every: 20
+
+    # ---- guidance and the displacement rail ---------------------------------------------------
+    guidance_scale: 75.0          # ABLATION KNOB: 0 leaves the joint pool and the SMC machinery with
+                                  # no tilt, the clean "is the tilt doing anything" control
+    guidance_max_rms_a: 6.0       # size-invariant rail, cap = rho*sqrt(3*n_atoms); 704.9 A at 4601 atoms
+    guidance_max_norm: 0          # the absolute rail, zeroed. rms_a takes precedence when > 0, so a
+                                  # non-zero value here would be inert and misleading.
+
+    # ---- off by default, one gate each --------------------------------------------------------
+    physicality_filter: false
+    realloc_enabled: false
+    reserve_enabled: false
+    direction_enabled: false
+    orient_enabled: false
+    facing_enabled: false

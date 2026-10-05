@@ -1,0 +1,193 @@
+# TDS (Wu et al. 2306.17775): twisted proposal + exact weight correction.
+# DEFAULTS ARE THE EPITOPE (binding-site) CV: scale 75, auto clip 6 (guidance_max_rms_a, the
+# absolute guidance_max_norm is ZEROED), umbrella "9,11,13,15" in centroid_A. The conformation CV
+# (cdr_rmsd) is still supported and its settings are kept as comments beside each field --
+# switching CV means changing reward, guidance_scale, guidance_max_norm, umbrella_sweep AND
+# sweep_units together, never one alone.
+# Canonical per-method config: reward/repulsion as specified, no blending.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m2_tds
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m2_tds
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    # BUDGET SHAPE IS FORCED -- 1 seed x N samples, not 20 x 50. With the hybrid map pinned above
+    # (12-15 candidate sites) and 4 umbrellas, the cell grid is 60 cells, and check_cell_budget
+    # returns "error" below ~360 particles PER SEED: at 50 it reported "10 cell(s) end up with NO
+    # tilted particle", i.e. those binding hypotheses are never steered and the run completes anyway.
+    # A 20x50 default would be 1000 structures, over the 780 ceiling.
+    #
+    # THIS IS THE SEPARATE MODEL'S REAL CONSTRAINT, not a tuning choice. At a fixed 720 total it
+    # cannot have both several latents AND a populated cell grid: 2 seeds would leave 360 particles
+    # each, 4 would leave 180 (3 per cell). So the separate model buys latent diversity by starving
+    # the site sweep. That is precisely what the joint pool (m5_cast.yaml) exists to avoid: K latents
+    # share ONE 720-particle filter, so the grid stays at 12 per cell whatever K is.
+    # The pool job templates pass n_seeds and n_samples_per_seed explicitly on every arm, so these
+    # defaults bind only for a bare `--config` run.
+    # 720 divides the grid exactly: 60 cells x 12 particles, and at K=4 the latent allocation is
+    # [180,180,180,180]. 780 remains the project CEILING, this is the operating point under it.
+    # Note K=5 does NOT fit here: 12//5 = 2 per latent per cell, below the floor check_cell_budget
+    # enforces.
+    n_samples_per_seed: 720
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:                     # MSA subsample block, matching b0b. Each subsample runs one
+                                       # coupled population, which is the diffusion axis.
+      policy: random
+      depth: 1000
+      n_seeds: 1
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  # FAMILY, not the method name: run_ablation accepts only
+  #   best_of_n | search | guidance | interaction
+  # and RAISES on anything else. The family groups by MECHANISM; the specific published method is
+  # `diffusion_search.algorithm` below, and run_ablation checks that it belongs to this family.
+  diffusion_side: guidance
+  label: m2_tds
+  diffusion_search:
+    algorithm: tds                      # gradient-twisted proposal WITH importance correction
+    # ================= CV SELECTION: epitope is the DEFAULT, cdr_rmsd is documented ==============
+    # reward=epitope (DEFAULT) -> BINDING SITE. Moves the antibody as a RIGID BODY, so it barely
+    #     deforms the fold. It is the CV the shipped defaults are calibrated for.
+    #     Needs $PROTENIX_EPITOPE_MAP.
+    #     Umbrellas are CENTROID DISTANCES, so sweep_units MUST be centroid_A.
+    #
+    # reward=cdr_rmsd -> CONFORMATION. Deforms CDR loops. RETAINED FOR REFERENCE, NOT RECOMMENDED:
+    #     the reward points in an unhelpful direction rather than being a tuning failure -- the CV
+    #     drives pool spread toward a 5-7 A attractor wherever it starts, and never moves the
+    #     binding pose, which is what DockQ scores.
+    #     To switch back, set ALL FOUR of these together:
+    #         reward:            cdr_rmsd
+    #         guidance_scale:    15.0      (the peak at a free rail)
+    #         guidance_max_norm: 2000.0    (free rail, does not bind until about scale 20)
+    #         umbrella_sweep:    "0.5,1.5,2.5,3.5,4.5,5.5,6.5"   with sweep_units: rmsd_A
+    #
+    # THE TWO CVs DO NOT SHARE A STRENGTH SETTING. Do not carry a number across: an epitope d* is a
+    # centroid distance where 1-3 A is INSIDE one binding site, while a cdr_rmsd d* of 1-3 A is a
+    # meaningful conformational shell.
+    # ============================================================================================
+    reward: epitope                     # CV-DEPENDENT: epitope (default) | cdr_rmsd
+
+    # DEPLOYABLE MAP IS THE DEFAULT, and the builder is PINNED so it cannot silently change.
+    # `epitope_source` only says oracle-vs-predicted, it collapses every predictor to "predicted",
+    # so a hybrid pool-mode+tile map, a DiscoTope-3 map and a surface-tile map are indistinguishable
+    # in the spec, the label and the results. `epitope_map_builder` names the CONSTRUCTION, and
+    # tts_job_lib.py:405 refuses to run when it disagrees with the map's own `_builder` stamp -- so
+    # handing this config a DiscoTope or ensemble map now fails preflight instead of running as
+    # something other than what the results will claim. hybrid_modes_tiles = coverage from an
+    # exhaustive surface tiling, ordering from the unsteered pool's own binding modes, no ground
+    # truth anywhere in it.
+    # For an ORACLE upper bound set epitope_source=ground_truth on the command line; do not edit
+    # this file, because then every run of it stops being the deployable number.
+    epitope_source: predicted
+    epitope_map_builder: hybrid_modes_tiles
+    sweep_units: centroid_A             # MUST match the CV: centroid_A for epitope, rmsd_A for
+                                        # cdr_rmsd. Preflight rejects the mismatch rather than
+                                        # letting a run steer on the wrong scale.
+    rmsd_subset: paratope               # the CDR loops, not the whole protein
+    guidance_scale: 75.0                # the calibrated setting for reward=epitope, fixed against
+                                        # the absolute clip 700 that guidance_max_rms_a=6 replaced.
+                                        # 6*sqrt(3*n_atoms) is 704.9 A at 4601 atoms, i.e. the
+                                        # same rail at this size, so the calibration carries over.
+                                        # 75 is the LOW end of the usable range and the failure
+                                        # mode above it is tearing, not saturation, so do not raise
+                                        # it.
+                                        # CV-DEPENDENT: for reward=cdr_rmsd use 15.0 at a free
+                                        # rail. That curve turns over -- more transport stops
+                                        # buying diversity above ~15.
+    guidance_max_norm: 0                # ZEROED: guidance_max_rms_a below overrides it whenever it
+                                        # is > 0, so leaving 700 here only invites the reader to
+                                        # think the absolute rail is live. INERT while
+                                        # guidance_max_rms_a > 0, which OVERRIDES it.
+    guidance_max_rms_a: 6.0             # AUTO (size-invariant) CLIP. cap = 6*sqrt(3*n_atoms), which
+                                        # is 704.9 A at 4601 atoms -- within 0.7% of the absolute 700
+                                        # this replaces, and 672-845 A across the 8-target subset.
+                                        # An absolute cap cannot mean the same thing across targets:
+                                        # the equivalent of 700 spans 668-976 over the 8-target
+                                        # subset (atom counts 4185-8945).
+                                        # For reward=epitope this rail BINDS and is the real strength
+                                        # control, which is why it is swept while scale is held low.
+                                        #
+                                        # CV-DEPENDENT: for reward=cdr_rmsd use 2000.0 instead --
+                                        # a FREE rail. It sits far above the natural step (~100-200 A
+                                        # at scale 5), so it never binds and acts as a true safety
+                                        # device: guided_step keeps its sigma^2 schedule intact and
+                                        # guidance_scale is the only control. A BINDING rail CAPS
+                                        # diversity, it does not enhance it. Rail 2000 is free up to
+                                        # scale 15 and starts binding at scale 20.
+    # --- UMBRELLA DEFAULTS, ONE PER CV. The field is CV-dependent and the two sets are NOT
+    # interchangeable: cdr_rmsd d* are CONFORMATIONAL RMSD shells, epitope d* are paratope-epitope
+    # CENTROID DISTANCES (see `sweep_units`).
+    #
+    # HOW MANY UMBRELLAS YOU CAN AFFORD is set by the PER-SEED population, not the run total:
+    # sweep_targets splits ONE seed's n_samples_per_seed particles round-robin, and stratified
+    # resampling then selects WITHIN each umbrella group. Extra seeds replicate the design, they do
+    # not add resolution. At n_samples_per_seed=50:
+    #     4 umbrellas -> 13/13/12/12 per seed      8 umbrellas -> 7/7/6/6/6/6/6/6
+    #     6 umbrellas ->  9/9/8/8/8/8              12 umbrellas -> ~4 each, TOO THIN
+    # Below ~6 per group the within-group selection degenerates toward the identity, so 6-8
+    # umbrellas is the usable range at 50 samples. NOTE round-robin also means only the first
+    # n_samples_per_seed entries are ever assigned: a 9-entry sweep at N=4 silently uses just 4.
+    #
+    #   reward=cdr_rmsd   umbrella_sweep: "0.5,1.5,2.5,3.5,4.5,5.5,6.5"   sweep_units: rmsd_A
+    #       7 shells at 1 A spacing over the reachable span, giving 8/7/7/7/7/7/7 particles per
+    #       umbrella at 50 samples. The top shell stays below the 7.88 A natural pairwise ceiling,
+    #       above which the umbrella asks the pool to tear.
+    #
+    #   reward=epitope    umbrella_sweep: "9,11,13,15"   <- THE SHIPPED DEFAULT, 4 umbrellas
+    #       4 targets at 2 A spacing bracketing the 9.58-15.60 A native paratope-epitope range.
+    #       At N=720 over 15 map sites that is 60 cells x 12 particles, the umbrella count is the
+    #       lever that sets the cell grid, so raising it thins every cell (see check_cell_budget).
+    # DEFAULT = the epitope set. It is the umbrella the scale 75 / auto-clip-6 calibration was
+    # fixed at, so changing it invalidates that calibration.
+    #   reward=cdr_rmsd instead: umbrella_sweep: "0.5,1.5,2.5,3.5,4.5,5.5,6.5"  sweep_units: rmsd_A
+    umbrella_sweep: "9,11,13,15"
+    # early2 resample window. Non-empty resample_windows OVERRIDES
+    # resample_start_frac/resample_end_frac, and the umbrella default above is calibrated under
+    # this window.
+    resample_windows: "0.25:0.35"
+    # PINNED TO MATCH THE JOB TEMPLATE (SITE_HINGE=true, SITE_HUBER=4.0). The dataclass defaults are
+    # False / 0.0, so a bare `--config` run without these two keys computes a DIFFERENT reward. The
+    # dataclass keeps the conservative off-values on purpose, so that older configs stay
+    # bit-identical.
+    site_hinge: true
+    site_huber_delta: 4.0
+    # SEPARATE model: one diffusion per MSA subsample. The JOINT arrangement is its own algorithm,
+    # see m5_cast.yaml (algorithm: cast).
+    subsample_pool: 1
+    # Joint-model term, inert (and auto-forced False) at subsample_pool = 1.
+    weight_level_correction: false
+    lam_adaptive: true
+    target_ess_frac: 0.4
+    potential: difference
+    resample: ess
+    ess_fraction: 0.5
+    resample_scheme: systematic         # the TDS reference's default
+    schedule_every: 20
+    # PAIRED WITH resample_windows ABOVE. At 0.5 the scoring events land at 100/120/140/160/180 while
+    # the window is steps 50-70: DISJOINT, so zero resamples fire and the run silently degrades to
+    # transport-only while logging normally. 0.25 puts the events at 50/70/90/... so the window admits
+    # 50 and 70 and exactly 2 resamples fire. The two keys MUST move together.
+    schedule_start_frac: 0.25
+    physicality_filter: false           # master switch OFF (ConforMix filtering injects clones and
+                                        # depresses the very diversity being measured)
+    phys_use_clash: false               # per-criterion gates, both OFF by default
+    phys_use_plddt: false               # ON costs one confidence pass per particle per event,
+                                        # counted into confidence_passes so FLOPs reflect it
+    mini_rollout_steps: 4

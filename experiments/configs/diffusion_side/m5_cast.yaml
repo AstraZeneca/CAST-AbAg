@@ -1,0 +1,191 @@
+# CAST -- Cross-subsample Amortised Site Tilting.
+#
+#   K MSA-subsample latents share ONE particle filter, tilted by a SITE-measurable reward, with
+#   (umbrella x site) stratified resampling inside an early selection window.
+#
+# THE COST IDENTITY. Exploring K latents costs K x N structures with one diffusion per subsample.
+# CAST amortises them over a single N-particle filter and costs N + K - 1. Both are linear in K,
+# with slopes N and 1, so the cost is effectively constant in K over any usable range.
+#
+# ITS OWN ALGORITHM, NOT A tds FLAG. `subsample_pool` changes what a PARTICLE IS: under
+# tds a particle is a draw from one conditioning, under CAST it carries a latent index and competes
+# against particles from other conditionings. m2_tds.yaml stays the separate model, CAST is where
+# the joint arrangement lives.
+#
+# WHAT IT DOES NOT DO. The tilt is measurable with respect to the SITE coordinate only, so it leaves
+# the pose conditional exactly unchanged at every lambda (the pose-invariance result). It
+# relocates the antibody, it cannot repair a pose.
+#
+# ABLATION. Each mechanism below has its OWN gate and the line says what turning it off costs, so a
+# one-line override isolates one component. The five that define the method are marked ABLATION KNOB.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m5_cast
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m5_cast
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    # N PARTICLES IN THE SHARED POOL (not per latent), and NOT the house default of 50. At 50 this
+    # config is degenerate: epitope_source=predicted loads the multi-site hybrid map (12-15 sites),
+    # which against 4 umbrellas is 60 cells, and check_cell_budget returns "error" ("10 cell(s) end
+    # up with NO tilted particle") while the run completes anyway, having silently explored fewer
+    # binding hypotheses than the sweep asked for.
+    # 720 divides the grid exactly: 60 cells x 12 particles, and at K=4 the latent allocation is
+    # [180,180,180,180]. 780 remains the project CEILING, this is the operating point under it.
+    # Note K=5 does NOT fit here: 12//5 = 2 per latent per cell, below the floor check_cell_budget
+    # enforces.
+    n_samples_per_seed: 720
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1                   # mandatory: the coupled particle pool is single-process
+    msa_subsample:
+      policy: random
+      depth: 1000
+      n_seeds: 4                        # MUST equal method.diffusion_search.subsample_pool.
+                                        # run_ablation DERIVES this from subsample_pool when K>1
+                                        # (they live in different config namespaces, so the spec's
+                                        # __post_init__ cannot see both), the pool template derives
+                                        # it too. Set K, not this.
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  # FAMILY, not the method name: run_ablation accepts only
+  #   best_of_n | search | guidance | interaction
+  # and RAISES on anything else. CAST is registered under `guidance` (DIFFUSION_FAMILIES), beside
+  # fk and tds, because it is the same mechanism class: reward-tilted weights over a particle pool.
+  diffusion_side: guidance
+  label: m5_cast
+  diffusion_search:
+    algorithm: cast
+
+    # ---- reward -------------------------------------------------------------------------------
+    # MANDATORY AT subsample_pool>1, and NOT interchangeable with site_contact. tts_job_lib.py:452
+    # rejects any reward but `epitope` for a joint pool: mixed conditioning is sound only while the
+    # tilt is measurable w.r.t. the SITE alone (Cross_model_math Prop. 1), and a reward that reads
+    # pose or orientation does not cancel out of the pose conditional. site_contact at
+    # contact_weight=0.0 is bit-identical to this, but the guard tests the NAME, so do not
+    # "simplify" it back to site_contact.
+    reward: epitope               # the pure site CV: -h_delta(max(0, ||mu_p - mu_e|| - d*))
+    rmsd_subset: paratope
+    sweep_units: centroid_A
+    # BUILDER PINNED: tts_job_lib.py:405 refuses a map whose `_builder` stamp disagrees, so this
+    # config cannot silently run on a DiscoTope or ensemble map and report it as the same method.
+    epitope_map_builder: hybrid_modes_tiles
+    epitope_source: predicted     # ABLATION KNOB: `ground_truth` swaps the deployable map for the
+                                  # oracle epitope. Bounds what any reward shape could achieve if
+                                  # the map were perfect. Set it on the COMMAND LINE, not here.
+
+    # one-sided Huber hinge: r = -h_delta(max(0, d - d*)). The hinge zeroes reward AND gradient once
+    # a particle is inside d*, which is what makes the lambda -> 0 limit a conditioning on the arrival
+    # ball rather than a collapse onto a point.
+    site_hinge: true              # ABLATION KNOB: false -> plain harmonic -(d - d*)^2, which keeps
+                                  # pulling past d* and jams the antibody too close.
+    site_huber_delta: 4.0         # ABLATION KNOB: 0 -> unbounded quadratic far side.
+    contact_weight: 0.0           # INERT under reward=epitope, which has no contact term to weight.
+                                  # Kept at 0.0 and not deleted: it is the knob that would turn the
+                                  # shell on if the reward were ever switched to site_contact, and a
+                                  # non-zero value here must never look like it did something.
+    clash_enabled: false
+    site_softmin_tau: 0.0         # score each particle against its NEAREST candidate rather than its
+                                  # assigned one. No gain when no candidate is correct.
+    site_dev_cap: 0.0             # release a particle beyond |d - d*|; Huber only bounds the far side
+    site_floor: 0.0
+
+    # ---- stratification -----------------------------------------------------------------------
+    # ABLATION KNOB. Cells are umbrellas x sites, resampling is WITHIN a cell, which preserves cell
+    # occupancy so every candidate site keeps particles to the end. A single value collapses the
+    # umbrella axis and makes the pool bet everything on one target separation.
+    umbrella_sweep: "9,11,13,15"  # brackets the 9.58-15.60 A native paratope-epitope range
+                                  # 4 umbrellas x 15 sites = 60 cells, at N=720 that is 12 per cell,
+                                  # and below ~3 per subsample per cell selection degenerates to drift
+
+    # ---- the joint pool -----------------------------------------------------------------------
+    # ABLATION KNOB, AND THE DEFINING ONE. 1 turns CAST into plain tds (the separate model) and is the
+    # clean ablation of the whole idea. n_seeds is DERIVED from this (run_ablation and the pool
+    # template both force the match), because the diffusion is deferred to the K-th subsample and a
+    # mismatch silently never fires it.
+    subsample_pool: 4             # the pool is fixed at N, so raising K thins particles per
+                                  # subsample per cell. K=5 does not fit at N=720: it leaves 2 per
+                                  # latent per cell, below the MIN_PER_SUBSAMPLE=3 floor that
+                                  # base_search.py records as the point where one resample can drop
+                                  # a latent by chance.
+    weight_level_correction: true # ABLATION KNOB: required at K>1. `difference` telescopes to
+                                  # lam*(r_T - r_0), dividing out r_0 -- and r_0 is exactly what marks
+                                  # a subsample whose trunk already placed the paratope well.
+                                  # Auto-forced False at subsample_pool <= 1 by
+                                  # DiffusionSearchSpec.__post_init__.
+
+    # ---- SMC ----------------------------------------------------------------------------------
+    potential: difference         # ABLATION KNOB: `sum` scores absolute reward instead of improvement,
+                                  # letting a particle that started well dominate the weights forever
+    lam_adaptive: true            # calibrate lambda from the observed reward spread; a fixed lam
+                                  # cannot be right across targets whose reward scales differ
+    lam: 4.0                      # NOT inert while lam_adaptive -- it is the CAP on the solved
+                                  # lambda: min(lam, lambda_for_target_ess(...)). The solved lambda
+                                  # is around 0.01 here, so the cap does not bind, and lowering this
+                                  # below that WOULD silently become the operative tilt strength.
+    target_ess_frac: 0.4
+    resample: ess
+    ess_fraction: 0.5
+    resample_scheme: systematic
+
+    # ---- the selection window -----------------------------------------------------------------
+    # ABLATION KNOB, AND BOTH KEYS MOVE TOGETHER. resample_windows is a fraction of the trajectory.
+    # schedule_start_frac decides where the SCORING EVENTS fall. At schedule_every=20 over 200 steps,
+    # start_frac 0.25 puts events at 50/70/90/... and the window 0.25:0.35 admits 50 and 70 -- exactly
+    # 2 resamples. Set start_frac to 0.5 and the events move to 100-180, DISJOINT from the window:
+    # zero resamples fire and the run silently degrades to transport-only while logging normally.
+    #
+    # ONLY ONE OF THOSE 2 RESAMPLES IS TILTED, and the window is why. `difference` sets r_prev = r_cur
+    # at the FIRST scoring event, so its spread is identically zero, lam never calibrates there, and
+    # the FK increment and the level correction are both skipped (see protenix_hooks.py:3427/3443/3484).
+    # At the first event lam is therefore still 0 and the resample runs on the proposal correction
+    # alone, which selects mildly AGAINST the particles guidance moved most. The calibrated lam
+    # arrives at the second event, which is the only tilted resample in the run.
+    # The tilt is still carried continuously by the twisted proposal (gradient at 159/200 steps), it is
+    # the SMC CORRECTION that fires once.
+    # SCORING IS NOT WINDOW-GATED (events 90..190 still accumulate weights outside it), so r_prev and
+    # the lam calibration advance wherever the window sits. That is what makes the fix free. Windows,
+    # with in_resample_window inclusive at BOTH ends (guidance.py:263) and f = step/200:
+    #   0.25:0.35  admits 50,70     -> 2 resamples, 1 tilted   (current)
+    #   0.35:0.45  admits 70,90     -> 2 resamples, 2 tilted   <- same count, the clean isolation
+    #   0.25:0.45  admits 50,70,90  -> 3 resamples, 2 tilted   (confounds tilt with more resampling)
+    # Prefer 0.35:0.45 for the ablation: r_prev is still set at 50 and lam still calibrates at 70, but
+    # step 50 no longer resamples on proposal-correction noise. f=0.45 is well inside the FK reference's
+    # 0.2-0.8 band, so this is not late-resample duplication.
+    #   -> lowering schedule_start_frac instead also moves guidance onset, because `start` gates
+    #      _is_event and g_prev is only recomputed at events. Not a clean ablation of the window.
+    resample_windows: "0.25:0.35"
+    schedule_start_frac: 0.25
+    schedule_every: 20
+
+    # ---- guidance and the displacement rail ---------------------------------------------------
+    guidance_scale: 75.0          # ABLATION KNOB: 0 turns the tilt off entirely, leaving the joint
+                                  # pool and the SMC machinery -- the clean "is the tilt doing
+                                  # anything" control
+    guidance_max_rms_a: 6.0       # ABLATION KNOB: size-invariant rail, cap = rho*sqrt(3*n_atoms).
+                                  # 6 gives 704.9 A at 4601 atoms, within 0.7% of the absolute 700 it
+                                  # replaced, and 672-845 A across an 8-target size spread.
+    guidance_max_norm: 0          # the absolute rail, zeroed. rms_a takes precedence when > 0, so a
+                                  # non-zero value here would be inert and misleading.
+
+    # ---- off by default, one gate each --------------------------------------------------------
+    physicality_filter: false
+    realloc_enabled: false
+    reserve_enabled: false
+    direction_enabled: false
+    orient_enabled: false
+    facing_enabled: false

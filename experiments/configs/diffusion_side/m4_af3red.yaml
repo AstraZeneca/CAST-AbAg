@@ -1,0 +1,96 @@
+# AF3-ReD (OkazakiLab/af3_red, doi 10.64898/2025.12.17.693105) exactly as published.
+# Canonical per-method config: reward/repulsion as specified, no blending.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m4_af3red
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m4_af3red
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    n_samples_per_seed: 50              # = N particles (population returned)
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:                     # 20 MSA subsamples (block form; matches b0b); each runs a coupled population (the diffusion axis)
+      policy: random
+      depth: 1000
+      n_seeds: 20
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  # FAMILY, not the method name: run_ablation accepts only
+  #   best_of_n | search | guidance | interaction
+  # and RAISES on anything else. The family groups by MECHANISM; the specific published method is
+  # `diffusion_search.algorithm` below, and run_ablation checks that it belongs to this family.
+  diffusion_side: interaction
+  label: m4_af3red
+  diffusion_search:
+    algorithm: af3_red                  # Gaussian repulsive bias vs PREVIOUSLY COMPLETED structures
+    reward: cdr_rmsd                    # unused: af3_red has no reward term (kept for spec validity)
+    guidance_scale: 0.0                 # force-only; a reward gradient would be a second steering term
+    umbrella_sweep: ""                # no umbrellas: the bias is history-based, not target-based
+    # PINNED TO MATCH jobs/tts-steer-pool.yaml (SITE_HINGE=true, SITE_HUBER=4.0), which sets these
+    # on EVERY arm through $COMMON. Without them a run of this config outside the template falls
+    # back to the dataclass defaults (False / 0.0) and computes a DIFFERENT site reward. They are
+    # inert while this config's own reward is not a site reward, but the template can override
+    # the reward, so they must be present and agree.
+    site_hinge: true
+    site_huber_delta: 4.0
+    # --- TUNED VARIANT for CDR loops (NOT the published configuration) -------------------------
+    # On this target class w=100 (below) moves CDR loops very little, because the reference tunes it
+    # for many-Angstrom DOMAIN motion, and w=10000 destroys the fold.
+    # w~1000 is the useful scale here. red_weight is the ONLY parameter that changes -- everything
+    # else stays the published value. Enable per-run rather than editing this file, so results stay
+    # attributable:
+    #     --set method.diffusion_search.red_weight=1000
+    # Cite anything produced that way as a TUNED VARIANT, never as AF3-ReD as published.
+    # -------------------------------------------------------------------------------------------
+    red_weight: 100.0                   # REFERENCE DEFAULT. Every parameter in this file is the
+                                        # published one, so this config IS AF3-ReD as published.
+    # --- SIGMA IS THE KNOB, NOT WEIGHT ------------------------------------------------------------
+    # The bias is  V = w * sum_b exp( -MSD / 2(sigma+noise_level)^2 ).  `w` multiplies an EXPONENTIAL,
+    # so if that exponential is ~0 the weight cannot rescue it. The knob is SIGMA. But note WHICH
+    # WAY it acts, because it is not monotone.
+    #
+    # The FORCE is the gradient, ~ (MSD/(sigma+noise)^2) * exp(-MSD/2(sigma+noise)^2), so BOTH limits
+    # are weak and the maximum sits in between:
+    #     MSD >> sigma^2   the exponential vanishes           -> no force
+    #     MSD << sigma^2   the 1/(sigma+noise)^2 prefactor shrinks -> no force
+    # Which limit you are in depends on how far apart the compared structures actually are, so sigma
+    # CANNOT be calibrated without measuring the spread of the specific pool it will act on.
+    #
+    # Over sigma 2..15 the force DECREASES with sigma, so structures compared across seeds sit in
+    # the MSD << sigma^2 limit rather than the far one. Small transport does not mean small effect,
+    # because the bias is applied early and amplified through the remaining denoising steps.
+    red_sigma: 2.0                      # reference default, and the strongest of {2, 8, 15} here
+    red_n_smooth: 10                    # reference default. UNSMOOTHED repulsion tears the chain
+    red_bias_tmin: 2.0                  # reference default: no bias once sampling has sharpened
+    red_rmsd_subset: all                # paper geometry: C-alpha of the WHOLE protein
+    red_plddt_min: 60.0                 # reference excludes disordered residues from the bias RMSD.
+                                        # SET BUT DORMANT. The reference builds this mask from
+                                        # COMPLETED predictions, so the sampler is not the
+                                        # obstacle. The obstacle is that the cached mask the hook
+                                        # reads is built only on demand, by
+                                        # `token_maps af3red-plddt-mask`. It is not immaterial: on
+                                        # some targets the mask drops a large fraction of C-alpha.
+    red_bias_restrict: true             # reference default
+    red_cut_rmsd: 0.5                   # reference default (A)
+    physicality_filter: false           # master switch OFF (ConforMix filtering injects clones and
+                                        # depresses the very diversity being measured)
+    phys_use_clash: false               # per-criterion gates, both OFF by default
+    phys_use_plddt: false               # ON costs one confidence pass per particle per event,
+                                        # counted into confidence_passes so FLOPs reflect it
+    mini_rollout_steps: 4

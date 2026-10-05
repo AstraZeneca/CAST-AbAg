@@ -1,0 +1,65 @@
+# B0.b on the OpenDDE backend, the SAME unsteered Best-of-N pool as baseline/b0b.yaml, run through
+# a second co-folding model so a pool statistic (e.g. the epitope-mode map) can be compared ACROSS
+# models rather than trusted from one.
+#
+# Why a separate file rather than `--set model.backend=opendde` on b0b.yaml: `load_config` reads ONE
+# yaml and merges only dotlist overrides (config.py:42-44), there is no include/defaults mechanism, # so a cell config is standalone and the backend block has to live in the file that is loaded.
+#
+# PARITY WITH b0b.yaml is deliberate: identical seeds/samples/cycles/steps/depth and an identical
+# verifier block, so any difference in the resulting pool is the MODEL and not the sampling budget.
+# The two backends' confidence JSONs carry the same 16 keys on the same scales (plddt is 0-100 in
+# both), so every verifier transfers unchanged, see models/opendde.py item (4).
+#
+# BUDGET IS SEEDS x SAMPLES: 2 x 50 = 100 structures/target here, NOT "100 structures". Compare it
+# against a 100-structure RANDOM DRAW from the Protenix pool, never against that pool's full depth, # map quality and pool size would otherwise be confounded.
+#
+#   python -m experiments.scripts.run_ablation --config experiments/configs/baseline/b0b_opendde.yaml
+
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/b0b_opendde
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/b0b_opendde
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+
+model:
+  backend: opendde
+  seeds: [101]                         # fixed diffusion RNG (the seed axis is the MSA subsample)
+  run:
+    n_cycles: 10                       # OpenDDE -c (its own default is also 10)
+    n_samples_per_seed: 50             # OpenDDE -e
+    n_diffusion_steps: 200             # OpenDDE -p (its own default is also 200)
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1                  # >1 switches the backend to Fold-CP context parallelism
+    msa_subsample:
+      policy: random
+      depth: 1000
+      n_seeds: 2
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  opendde:
+    model_name: opendde_v1
+    root_dir: ${env:OPENDDE_ROOT_DIR}
+    abag: true                         # the antibody-antigen-tuned checkpoint (opendde_abag.pt)
+    executable: ${env:OPENDDE_BIN,opendde}   # console script lives in OpenDDE's OWN venv, not ours
+    # PAE GATE. OpenDDE writes *_full_data_sample_N.json (which carries token_pair_pae) ONLY when
+    # this is true, with it false, ipSAE/pDockQ2/LIS/iLIS silently score nothing. b0b.yaml sets the
+    # Protenix equivalent true for exactly this reason, so parity requires it here.
+    need_atom_confidence: true
+    # LEAVE THESE ON auto. Forcing 'torch' materialises the full N^3 triangle tensor, a 40.55
+    # GiB single allocation and an OOM at 691 tokens on an 80GB card, against a 19.7 GiB peak on
+    # auto (which resolves to cuEquivariance). See models/opendde.py item (3).
+    trimul_kernel: auto
+    triatt_kernel: auto
+    enable_tf32: true
+    enable_fusion: true
+    enable_cache: true
+
+verifier:
+  rank_by: ranking_score               # same selector as b0b.yaml; the PAE panel is still computed
+  ipsae: { pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0 }
+
+method:
+  diffusion_side: best_of_n
+  label: b0b_opendde

@@ -1,0 +1,391 @@
+pdb,abId,format,release,Hchain,Lchain,agChains,antigen,agUniProt
+27uh,sabdab2_H069PL0000,VHH,2026-08-05,A,,B|D,Protein S100-A4,P26447
+43yy,sabdab2_H06A2L04R1,Fab,2026-08-05,H,L,A,Spike glycoprotein,A0A7G4RNN0
+9pum,sabdab2_H06A3L0000,VHH,2026-08-05,H,,A,Hemagglutinin-neuraminidase,P12561
+9slq,sabdab2_H06A0L0000,VHH,2026-08-05,E,,A,phosphopyruvate hydratase,Q9NDH8
+9ty2,sabdab2_H069WL0000,VHH,2026-08-05,B,,A,Maltose/maltodextrin-binding periplasmic protein,P0AEY0
+9zrm,sabdab2_H069ML04QS,Fab,2026-07-29,H,L,Z,Envelope protein E,Q9Q6P4
+9plp,sabdab2_H060BL04GT,Fab,2026-07-22,C,D,A,Netrin-1,Q90922
+9pms,sabdab2_H069HL04QP,Fab,2026-07-22,H,L,C,Thy-1 membrane glycoprotein,P04216
+9rwi,sabdab2_H069GL04QN,Fab,2026-07-22,H,L,A,"HLA class I histocompatibility antigen, alpha chain G",P17693
+9vwo,sabdab2_H068QL0000,VHH,2026-07-22,B,,A,Oncostatin-M,P13725
+13bf,sabdab2_H068NL04Q0,Fab,2026-07-15,H,L,A,Collagen alpha-3(VI) chain,P12111
+13br,sabdab2_H068JL04PX,Fab,2026-07-15,H,L,A,Zinc-alpha-2-glycoprotein,P25311
+13bs,sabdab2_H068ML04PZ,Fab,2026-07-15,H,L,A,Interleukin-36 receptor antagonist protein,Q9UBH0
+9ruf,sabdab2_H0686L04PH,Fab,2026-07-15,H,L,B,"HLA class II histocompatibility antigen, DQ beta 1 chain",P01920
+9rug,sabdab2_H068KL04PY,Fab,2026-07-15,H,L,B,Lymphocyte antigen,Q29967
+9ruh,sabdab2_H068AL04PM,Fab,2026-07-15,H,L,B,HLA class II histocompatibility antigen DQ beta chain,Q5Y7D6
+9vso,sabdab2_H0689L04PK,Fab,2026-07-15,G,J,C|T,HLA class I antigen,P19544+Q53Z42
+9oef,sabdab2_H0682L04PD,Fab,2026-07-08,H,L,C,Spike protein VP38,C7BG48
+9rmk,sabdab2_H067JL0000,VHH,2026-07-08,F,,A,Oligosaccharyltransferase,G1FG65
+9vt4,sabdab2_H067PL0000,VHH,2026-07-08,G,,B|E,Envelope glycoprotein,A0A5J6EDK7+G8DB49
+10fj,sabdab2_H066PL04N6,Fab,2026-07-01,H,L,A,Low affinity immunoglobulin gamma Fc region receptor II-a,P12318
+9p9q,sabdab2_H066BL04MV,Fab,2026-07-01,H,L,A,Hemagglutinin HA1,Q82566
+9vh4,sabdab2_H065SL0000,VHH,2026-06-24,C,,A|B,Hemagglutinin HA1 chain,P03452
+9vh5,sabdab2_H0666L0000,VHH,2026-06-24,C,,A|B,Hemagglutinin,A0A2P1ADR1+B4UPJ0
+9rh1,sabdab2_H0637L00DJ,Fab,2026-06-17,B,C,A,Na(+)/H(+) antiporter NhaA,P13738
+9yq6,sabdab2_H0634L00B6,Fab,2026-06-10,D,E,A,Hemagglutinin-neuraminidase,Q81080
+12qj,sabdab2_H064EL04KC,Fab,2026-06-03,B,C,A,Choline binding protein E CbpE,A0A0T8F9T1
+13fl,sabdab2_H065JL0013,Fab,2026-06-03,A,B,C,Programmed cell death 1 ligand 1,Q9NZQ7
+9zg5,sabdab2_H064RL0000,VHH,2026-06-03,C,,A,Green fluorescent protein,A0A059PIQ0
+11ha,sabdab2_H064JL04KG,Fab,2026-05-27,G,K,A,Major capsid protein VP1,A0A1P8DD09
+11lt,sabdab2_H063WL04JX,Fab,2026-05-27,H,L,A|B|C,Capsid protein VP1,A0A1L7H9D2+A0A5B9NIG2+A0A7G9XUH9
+25pv,sabdab2_H065KL04M8,Fab,2026-05-27,C,D,A,Protective antigen PA-63,P13423
+35uh,sabdab2_H0644L04K4,Fab,2026-05-27,A,B,C,Tissue factor pathway inhibitor,Q2PFV4
+9qqs,sabdab2_H063KL0000,VHH,2026-05-27,C,,B,Multiple epidermal growth factor-like domains protein 8,Q7Z7M0
+9uuf,sabdab2_H0645L0000,VHH,2026-05-27,A,,B,Spike glycoprotein,A0A0A0Q7F6
+9v2u,sabdab2_H063DL024N,Fab,2026-05-27,H,L,A,Claudin-18,P56856
+9vl2,sabdab2_H0658L04M1,Fab,2026-05-27,C,B,A,Myeloid cell surface antigen CD33,P20138
+9y7l,sabdab2_H063ZL04K1,Fab,2026-05-27,B,C,A,Assemblin,P16753
+9yxv,sabdab2_H0656L04KZ,Fab,2026-05-27,E,D,C,Protein G,P19909
+9yxv,sabdab2_H0657L04M0,Fab,2026-05-27,H,L,A,U1 small nuclear ribonucleoprotein A,P09012
+11zw,sabdab2_H0613L04H8,Fab,2026-05-13,H,L,A,PDCoV IL121_2014 receptor binding domain,F1NWE3
+12oy,sabdab2_H0607L0000,VHH,2026-05-13,B,,A,"Mitochondrial carrier homolog 2,Mitochondrial brown fat unco",P25874
+9ebc,sabdab2_H0615L04H9,Fab,2026-05-13,G,H,A,Hemagglutinin HA1,A0AAX6NNG0
+9oj4,sabdab2_H060FL04GY,Fab,2026-05-13,B,A,C,Leucine-rich repeat-containing protein 15,Q80X72
+9xzx,sabdab2_H060QL0000,VHH,2026-05-06,C,,A,Enterotoxin type C-2,P34071
+9y3x,sabdab2_H060TL04H4,Fab,2026-05-06,H,L,E,Hemagglutinin,G8EHJ9
+21aq,sabdab2_H0616L04HA,Fab,2026-04-29,A,B,H,2-acetamido-2-deoxy-beta-D-glucopyranose-(1-4)-2-acetamido-2,A0A7S9CEK0
+9rig,sabdab2_H055HL03YF,Fab,2026-04-29,H,L,A|B,Genome polyprotein,A0A2L1GIK5+E5RPG5
+9rij,sabdab2_H05GAL0465,Fab,2026-04-29,H,L,A|B,Genome polyprotein,A0A811CJB4+F8SSL7
+9uoc,sabdab2_H060ZL0000,VHH,2026-04-29,A,,B,Spike glycoprotein,A0A0B5KY46
+29on,sabdab2_H0614L0000,VHH,2026-04-22,C,,A,Antiseptic resistance protein,P0A0J9
+9qqe,sabdab2_H0604L04GM,Fab,2026-04-15,H,L,A,MHC class I antigen,U5YJM1
+9qqf,sabdab2_H061CL04HF,Fab,2026-04-15,H,L,A,MHC class I antigen,A0A5H2UF23
+9np0,sabdab2_H05Q5L04B7,Fab,2026-04-01,B,C,A,Annexin A1,P04083
+9jkr,sabdab2_H0528L03W8,Fab,2026-03-25,C,D,I,Fab region of F1 antibody heavy chain,P04141
+9t5z,sabdab2_H05HXL047A,Fab,2026-03-25,H,L,B,Integrin beta-2,P05107
+9u5q,sabdab2_H021VL04BC,Fab,2026-03-25,B,C,A,Protease 3C,P03303
+9ulp,sabdab2_H05QNL0000,VHH,2026-03-25,C,,A,Iron-hydroxamate ABC transporter substrate-binding protein,A0A5S4TPK8
+10op,sabdab2_H003SL003N,Fab,2026-03-18,S,T,B|F,Envelope glycoprotein 2,R4QJ45
+9m72,sabdab2_H0566L03YZ,Fab,2026-03-18,A,B,C,p15,Q65179
+9ma0,sabdab2_H051DL03VM,Fab,2026-03-18,B,C,A,Envelope glycoprotein GP350,P03200
+9s6r,sabdab2_H05XXL011A,Fab,2026-03-18,H,L,A,"Dol-P-Man:Man(5)GlcNAc(2)-PP-Dol alpha-1,3-mannosyltransfera",P38179
+9s6t,sabdab2_H05XZL04FH,Fab,2026-03-18,H,L,A,Mannosyltransferase,F1P077
+9wwh,sabdab2_H05MBL0494,Fab,2026-03-18,A,B,C,Interleukin-33 (109-270),O95760
+9ncy,sabdab2_H05RGL04C3,Fab,2026-03-11,H,L,A,Circumsporozoite protein,Q7K740
+9yxd,sabdab2_H05JHL047V,Fab,2026-03-11,D,C,A|B,Glycoprotein hormones alpha chain,P01215+P01225
+9iar,sabdab2_H056YL0000,VHH,2026-03-04,C,,A,Sodium-independent sulfate anion transporter,Q86WA9
+9w45,sabdab2_H05R2L0000,VHH,2026-03-04,N,,A|B,Guanine nucleotide-binding protein G(s) subunit alpha,P62873+Q5FWY2
+9wai,sabdab2_H05MQL049D,Fab,2026-03-04,E,F,B|D,Capsid protein VP2,P03300
+9zen,sabdab2_H05H0L0000,VHH,2026-03-04,K,,G|H,Histone H2A type 1-B/E,O60814+P04908
+9i5n,sabdab2_H05EML044T,Fab,2026-02-25,B,A,C,"CD40 ligand, soluble form",P29965
+9jno,sabdab2_H05ARL041Y,Fab,2026-02-18,D,B,A,Hemagglutinin,A0A2Z5DTY1
+9l8z,sabdab2_H0548L03XK,Fab,2026-02-18,C,B,A,Hemagglutinin,A0A8F6YIY6
+9lsy,sabdab2_H062PL04JJ,Fab,2026-02-18,E,C,D,TRA@ protein,Q6PJ56
+9ncd,sabdab2_H05PGL04AP,Fab,2026-02-18,H,L,A,Non-specific lipid-transfer protein,B6CG41
+9nnz,sabdab2_H05N2L0000,VHH,2026-02-18,A,,B,Rhodopsin,P02699
+9qto,sabdab2_H05ZXL0000,VHH,2026-02-18,F,,A|B,"Neuronal acetylcholine receptor subunit alpha-7,CHRNA7 (exon",A0A0A6YYA8
+9ugo,sabdab2_H05KVL048T,Fab,2026-02-18,B,A,C,Middle S protein,B8QJB4
+9qrv,sabdab2_H05S2L04CB,Fab,2026-02-11,H,L,D,SULFATE ION,A0A2K5X4G5
+9th6,sabdab2_H05KFL0000,VHH,2026-02-11,B,,A,Guanine-N7 methyltransferase nsp14,P0DTD1
+9uaq,sabdab2_H05MGL0000,VHH,2026-02-11,D,,A|G,"H3-PrAC-5350A,2-dehydro-3-deoxyphosphogluconate aldolase/4-h",Q6YGZ0+Q9WXS1
+9y0a,sabdab2_H05NVL04A7,Fab,2026-02-11,A,B,C,Major pollen allergen Bet v 1-A,P15494
+9n38,sabdab2_H05MRL049E,Fab,2026-02-04,H,L,A,leukocidin-like protein 1,Q2FFA3
+9xqn,sabdab2_H05HJL0473,Fab,2026-02-04,C,B,A,"Probable G-protein coupled receptor 75,Soluble cytochrome b5",O95800
+9yc5,sabdab2_H05JNL047Y,Fab,2026-02-04,H,L,A,Urokinase plasminogen activator surface receptor,Q03405
+9yio,sabdab2_H05J6L047J,Fab,2026-02-04,D,C,B,PvRipr EGF7-8,A0A564ZTL5
+9loe,sabdab2_H0574L03ZF,Fab,2026-01-28,B,C,A,Envelopment polyprotein,A0A1S6XXK1
+9rxi,sabdab2_H05JGL0000,VHH,2026-01-28,H,,B,Cathepsin D (A01 family),G4VEV6
+9vnp,sabdab2_H05KRL048R,Fab,2026-01-28,C,A,L,Interferon gamma,P01579
+9e6j,sabdab2_H057VL0401,Fab,2026-01-21,H,L,A,Hemagglutinin,A7UPX0
+9hbp,sabdab2_H053ZL0000,VHH,2026-01-21,E,,A,Hemagglutinin glycoprotein,Q9QPQ8
+9lme,sabdab2_H05GWL0000,VHH,2026-01-21,C,,B,CD276 antigen,Q5ZPR3
+9mpz,sabdab2_H05GHL046B,Fab,2026-01-21,H,L,A|B|C,Capsid protein VP1,A2I7M2
+9nby,sabdab2_H00QHL00MT,Fab,2026-01-21,H,G,E,Envelope glycoprotein gp120,A0A1I9J633
+9nsd,sabdab2_H05S1L0000,VHH,2026-01-21,C,,B,"Cysteine-rich small secreted protein CSS, putative",A0A565A192
+9o3d,sabdab2_H05NPL04A2,Fab,2026-01-21,A,B,D,2-acetamido-2-deoxy-beta-D-glucopyranose,X4ZFZ7
+9fte,sabdab2_H055AL0000,VHH,2026-01-14,B,,A,Adhesion G protein-coupled receptor V1,B8JJE0
+9gvn,sabdab2_H051RL03VT,Fab,2026-01-14,C,D,A|B,Interleukin-5,P05113
+9l9y,sabdab2_H05DSL044Q,Fab,2026-01-14,A,B,D,Capsid protein,D3VV84
+9mns,sabdab2_H05G1L045X,Fab,2026-01-14,H,L,E,Envelope glycoprotein E2,B9V0E2
+9mqo,sabdab2_H05A3L041G,Fab,2026-01-14,B,C,A|P,Tumor necrosis factor receptor superfamily member 17,Q02223
+9msc,sabdab2_H04XFL03RV,Fab,2026-01-14,H,L,E,2-acetamido-2-deoxy-beta-D-glucopyranose-(1-4)-2-acetamido-2,P26664
+9ua5,sabdab2_H05P1L04AC,Fab,2026-01-07,G,K,C,Glycoprotein,R9W5Z3
+9vdy,sabdab2_H05H3L04BA,Fab,2026-01-07,C,D,A,Envelopment polyprotein,W5VWE0
+9xqb,sabdab2_H05RSL04C7,Fab,2026-01-07,A,B,C,A2A receptor-BRIL,P29274
+9npt,sabdab2_H05RBL0000,VHH,2025-12-31,G,,A,Envelope glycoprotein GP1,Q1PDC7
+9p8x,sabdab2_H05PTL04AX,Fab,2025-12-31,H,L,A,Tumor necrosis factor receptor superfamily member 18,Q9Y5U5
+9pru,sabdab2_H05JXL0485,Fab,2025-12-31,B,A,W,Low affinity immunoglobulin gamma Fc region receptor III-A,P08637
+9uza,sabdab2_H05R6L04BY,Fab,2025-12-31,C,D,B,RNA-directed RNA polymerase L,D5MEH7
+9uzb,sabdab2_H05HRL0478,Fab,2025-12-31,H,L,A,RNA-directed RNA polymerase L,A0A0M5KLS1
+9yc3,sabdab2_H05KAL0000,VHH,2025-12-31,A,,B,Male gamete fusion factor HAP2,Q8IJQ3
+9ho4,sabdab2_H057KL0000,VHH,2025-12-24,C,,A,Frataxin mature form,Q16595
+9og1,sabdab2_H05HBL046X,Fab,2025-12-24,B,C,A,A28L,Q8V4V0
+9pf9,sabdab2_H05QQL04BJ,Fab,2025-12-24,H,L,G,BLLF1,A0A0C7T6S7
+9m5b,sabdab2_H05E2L044B,Fab,2025-12-17,A,B,C,Low affinity immunoglobulin gamma Fc region receptor II-b,P31994
+9pd2,sabdab2_H05RFL04C2,Fab,2025-12-17,H,L,A,Paired immunoglobulin-like type 2 receptor alpha,Q9UKJ1
+9ytd,sabdab2_H05KDL048G,Fab,2025-12-17,H,L,A|C,"HLA class I histocompatibility antigen, A alpha chain",A5I8L1+P15309
+9ytf,sabdab2_H05J3L047G,Fab,2025-12-17,F,G,A|C,MHC class I antigen,A0A1D3TZM3+P43357
+9z5q,sabdab2_H05S9L0000,VHH,2025-12-17,A,,B,E3 ubiquitin-protein ligase NEDD4-like,Q96PU5
+9glz,sabdab2_H05BCL0000,VHH,2025-12-10,C,,A,GTPase KRas,A0A7K5XXT4
+9hjk,sabdab2_H055TL0000,VHH,2025-12-10,B,,A,"Cationic amino acid transporter 4, vacuolar",Q8W4K3
+9kwe,sabdab2_H04YVL03SP,Fab,2025-12-10,H,L,E,Butyrophilin subfamily 3 member A2,P78410
+9lad,sabdab2_H0570L0000,VHH,2025-12-10,B,,C,Neuronal pentraxin-2,P97738
+9pi9,sabdab2_H05K1L0488,Fab,2025-12-10,A,B,E|F,Sacituzumab Heavy Chain,P09758
+9z3q,sabdab2_H05NQL04A3,Fab,2025-12-10,D,C,E,Envelope glycoprotein H,F5HAK9
+9hi4,sabdab2_H00Q7L03WK,Fab,2025-12-03,K,L,C,FI6-focused design_03,A0ABC9N7E0
+9ot6,sabdab2_H05JWL0000,VHH,2025-12-03,C,,F,Tetratricopeptide repeat protein 7B,Q86TV6
+9yp2,sabdab2_H05R4L0000,VHH,2025-12-03,C,,A|B,Capsid protein,A0A4D6I9J0
+9i59,sabdab2_H05GGL046A,Fab,2025-11-26,H,L,A,Envelopment polyprotein,A2T080
+9lue,sabdab2_H05B6L042A,Fab,2025-11-26,A,B,G,Glycoprotein G,Q9IH62
+9njl,sabdab2_H05PAL04AH,Fab,2025-11-26,H,L,A|B,Envelope glycoprotein GP1,P35253
+9hq5,sabdab2_H059BL0000,VHH,2025-11-19,B,,A,CD63 antigen,P08962
+9kkj,sabdab2_H04WML03R7,Fab,2025-11-19,H,L,A,Nectin-4,Q96NY8
+9kmc,sabdab2_H04XDL03RS,Fab,2025-11-19,E,F,A,Interleukin-2 receptor subunit alpha,P01589
+9qt3,sabdab2_H05M7L0491,Fab,2025-11-19,B,C,A,Envelop protein OPG153,P24758
+9x1h,sabdab2_H05PZL04B3,Fab,2025-11-19,H,L,A,Complement C1s subcomponent heavy chain,P09871
+9n5z,sabdab2_H05PXL04B1,Fab,2025-11-12,A,B,C,Hemagglutinin,A0A3S5H8L7
+9nh7,sabdab2_H05Q1L0000,VHH,2025-11-12,E,,B|H,Hemagglutinin HA1 chain,A4GCK8
+9bn7,sabdab2_H05SFL0000,VHH,2025-11-05,D,,A|C,Tumor necrosis factor,P01375
+9bop,sabdab2_H057HL03ZS,Fab,2025-11-05,A,B,S,Virion spike glycoprotein GP1,A0A8G0KJC2
+9h77,sabdab2_H054CL0000,VHH,2025-11-05,A,,C,M-phase phosphoprotein 8,Q99549
+9puo,sabdab2_H05HML0474,Fab,2025-11-05,A,B,C,Leptin,P41159
+9qzq,sabdab2_H05K2L0000,VHH,2025-11-05,N,,A,Sodium/bile acid cotransporter,Q14973
+9r10,sabdab2_H05MCL0495,Fab,2025-11-05,H,L,A,Multidrug and toxin extrusion protein 1,Q96FL8
+9rit,sabdab2_H05QDL0000,VHH,2025-11-05,A,,C,Cytotoxin 1,P01468
+9eyd,sabdab2_H04W9L0000,VHH,2025-10-29,B,,A,Lysine-specific permease,Q9HVG3
+9ezh,sabdab2_H0511L0000,VHH,2025-10-29,B,,A,V-set and immunoglobulin domain-containing protein 4,Q9Y279
+9sfx,sabdab2_H05QVL04BP,Fab,2025-10-29,H,L,C,Interleukin-17A,Q16552
+9ubq,sabdab2_H05K5L048B,Fab,2025-10-29,C,D,A|B,Middle S protein,B5TFB1
+9uev,sabdab2_H05QGL0000,VHH,2025-10-29,C,,A,SFTSV Gn head,A0A8F5LQV3
+9uk5,sabdab2_H05MDL0496,Fab,2025-10-29,H,L,A,Interleukin 31,C7G0W1
+9hh9,sabdab2_H04YTL03SN,Fab,2025-10-22,E,D,A,Glycoprotein,B7UCZ5
+9jo7,sabdab2_H05DQL0000,VHH,2025-10-22,C,,B|D,C-reactive protein,P02741
+9ub6,sabdab2_H05NTL0000,VHH,2025-10-22,B,,A,Glycoprotein N,R4V2Q5
+9dvd,sabdab2_H052HL03WF,Fab,2025-10-15,H,L,A,Glycoprotein,F4YH71
+9lra,sabdab2_H0503L03TJ,Fab,2025-10-15,H,L,K,2-acetamido-2-deoxy-beta-D-glucopyranose,P43627
+9nrj,sabdab2_H04ZSL0000,VHH,2025-10-15,T,,A|B,M1-specific T cell receptor alpha chain,P0DSE1+P0DSE2
+9ntq,sabdab2_H05N7L0000,VHH,2025-10-15,B,,A,Glypican-3,P51654
+9gv3,sabdab2_H0509L0000,VHH,2025-10-01,E,,A,Fructose-bisphosphate aldolase,G0UWE7
+9js6,sabdab2_H04WZL03RG,Fab,2025-10-01,H,L,B,Envelope protein E,A0A024B7W1
+9leo,sabdab2_H05W5L04E8,Fab,2025-10-01,C,D,H,Attachment glycoprotein,A0AAX3C924
+9nn9,sabdab2_H05RHL0000,VHH,2025-10-01,B,,A,Ubiquitin-like protein ISG15,P05161
+9osr,sabdab2_H05QAL04BD,Fab,2025-10-01,H,L,A,Neuraminidase,Q8AZ87
+9pix,sabdab2_H05HPL0476,Fab,2025-10-01,H,L,A|P,MHC class I antigen,P17391+Q8WLS4
+9jec,sabdab2_H05AVL0000,VHH,2025-09-24,D,,A|B,Tumor necrosis factor,P51742
+9mqr,sabdab2_H04Z8L03T0,Fab,2025-09-24,D,E,A,Adhesion G protein-coupled receptor E5,P48960
+9mtf,sabdab2_H05G6L0462,Fab,2025-09-24,H,L,A,Hemagglutinin (HA1 polypeptide) from influenza H1N1 A/Solomo,A0A0G2RTI0
+9mtg,sabdab2_H05GJL046C,Fab,2025-09-24,H,L,E|F,Hemagglutinin,A0A7U0YFD5+A0A7U3R9T0
+9s8w,sabdab2_H05Q9L04BB,Fab,2025-09-24,H,L,A,Heparanase,Q9Y251
+9r19,sabdab2_H05P7L0000,VHH,2025-09-17,D,,A,Processed angiotensin-converting enzyme 2,Q9BYF1
+8s72,sabdab2_H05XDL04F8,Fab,2025-09-10,H,L,A|N,Short neurotoxin 1,P01426
+9det,sabdab2_H05W3L0000,VHH,2025-09-10,q,,a,V-type proton ATPase 116 kDa subunit a 4,Q9HBG4
+9gmu,sabdab2_H04X0L0000,VHH,2025-09-10,C,,B,Integrin alpha-M,P11215
+9px5,sabdab2_H05PCL048P,Fab,2025-09-10,H,L,A,"Maltose/maltodextrin-binding periplasmic protein,Triggering ",P0AEX9
+9b6u,sabdab2_H053DL03WR,Fab,2025-09-03,F,G,B|C,Envelope protein E,P03314
+9e7k,sabdab2_H05G7L0000,VHH,2025-09-03,C,,A|B,Ubiquitin carboxyl-terminal hydrolase isozyme L5,Q16186+Q9Y5K5
+9hls,sabdab2_H051KL0000,VHH,2025-09-03,C,,B,Entry-fusion complex protein OPG094,P07611
+9imx,sabdab2_H059SL0000,VHH,2025-09-03,C,,A,Secreted protein ORF2,P33426
+9jzq,sabdab2_H0516L03VD,Fab,2025-09-03,A,B,E,Envelope glycoprotein E,Q9J3M8
+9s35,sabdab2_H05KNL0000,VHH,2025-09-03,B,,A,GDP-mannose transporter,Q5A477
+8vxj,sabdab2_H04QVL03MS,Fab,2025-08-27,A,B,D,Apolipoprotein A-I,P02647
+9byf,sabdab2_H04Z4L03SW,Fab,2025-08-27,H,L,A,Outer surface protein A,P0CL66
+9d41,sabdab2_H050QL03V1,Fab,2025-08-20,H,L,A,Borealin,Q53HL2
+9irb,sabdab2_H05ERL044X,Fab,2025-08-20,H,L,A,Solute carrier family 15 member 4,Q8N697
+9k0c,sabdab2_H04WSL03RC,Fab,2025-08-20,H,L,A,Sodium- and chloride-dependent taurine transporter,P31641
+9kvd,sabdab2_H050RL03V2,Fab,2025-08-20,D,F,C,Spike protein S1,A0A8B1JP47
+9cye,sabdab2_H04Z9L03T1,Fab,2025-08-13,E,I,B,Neuraminidase,C7FH46
+9eit,sabdab2_H04ZML03S3,Fab,2025-08-13,H,L,A,Neuraminidase,A1ILL9
+9eje,sabdab2_H04Y0L03S3,Fab,2025-08-13,H,L,A,Neuraminidase,A0A223PTE0
+9ejf,sabdab2_H05CKL043B,Fab,2025-08-13,H,L,D,beta-D-mannopyranose-(1-4)-2-acetamido-2-deoxy-beta-D-glucop,C4RT50
+9lfl,sabdab2_H040RL044G,Fab,2025-08-13,B,C,A,Tumor necrosis factor receptor superfamily member 1B,P20333
+9mvu,sabdab2_H05H8L0000,VHH,2025-08-13,D,,A,Envelope glycoprotein B,P08666
+9my8,sabdab2_H05QPL0000,VHH,2025-08-13,A,,B,Glycoprotein D,Q69467
+9q8l,sabdab2_H05JAL047P,Fab,2025-08-13,H,L,A,Programmed cell death protein 1,Q15116
+9bqw,sabdab2_H056RL03Z8,Fab,2025-08-06,H,L,A,Decorin-binding protein A,O50917
+9dn2,sabdab2_H059ZL041E,Fab,2025-07-30,H,L,A,Hemagglutinin,A0A5B8WJL2
+9e21,sabdab2_H05BKL042K,Fab,2025-07-30,H,L,S,SARS XBB.1.5 Spike,A0A6V7ALX9
+9e7n,sabdab2_H05CML0000,VHH,2025-07-30,C,,A,Gametocyte surface protein P230,P68874
+9iw2,sabdab2_H0515L03VC,Fab,2025-07-30,H,L,P,Togavirin,Q1H8W5
+9jcy,sabdab2_H04WQL03RA,Fab,2025-07-30,C,B,A,Spike protein S1,Q5MQD0
+9jd0,sabdab2_H057DL0000,VHH,2025-07-30,E,,C,Transmembrane protease serine 2 catalytic chain,O15393
+9mla,sabdab2_H05A8L041M,Fab,2025-07-30,G,J,A,Surface protein,P61570
+9mlk,sabdab2_H05CQL043C,Fab,2025-07-30,H,L,A|C,Transmembrane protein,Q69384
+9njy,sabdab2_H05J7L047K,Fab,2025-07-30,H,L,A,Clumping factor A,Q99VJ4
+9ore,sabdab2_H05NYL04A9,Fab,2025-07-30,H,L,A,Fusion glycoprotein F0,Q6WB98
+9g3d,sabdab2_H05CEL0000,VHH,2025-07-23,C,,A|B,Peptide antibiotic transporter SbmA,P0AFY6
+9jie,sabdab2_H04XQL03S0,Fab,2025-07-23,C,D,B,Pro-secreted protein ORF2,A0A3G1TVH2
+9jii,sabdab2_H04YHL03SG,Fab,2025-07-23,F,E,B,Pro-secreted protein ORF2,A0A089GJI0
+9jio,sabdab2_H0527L03W7,Fab,2025-07-23,E,F,A|B,Secreted protein ORF2,P29326
+9mqv,sabdab2_H053QL03X7,Fab,2025-07-23,H,L,A,Neuraminidase,A0A193ACB1
+9n0d,sabdab2_H05QTL04BN,Fab,2025-07-23,E,D,B,Pre-glycoprotein polyprotein GP complex,P26313
+9ei9,sabdab2_H053CL03X4,Fab,2025-07-16,H,J,B|E|F,Hemagglutinin HA1,A0A3G2CC79+A0A5P1MU07
+9fys,sabdab2_H04Y2L0448,Fab,2025-07-16,B,C,X|Z,Alpha-bungarotoxin,P60615
+9fyt,sabdab2_H04Y2L03S5,Fab,2025-07-16,C,D,A|B,Alpha-cobratoxin,P01391
+9h39,sabdab2_H04XTL0000,VHH,2025-07-16,C,,A,LysM type receptor kinase,D3KU00
+9h6v,sabdab2_H051FL0000,VHH,2025-07-16,E,,B,LysM type receptor kinase,D3KTZ6
+9hlw,sabdab2_H02NWL0000,VHH,2025-07-16,H,,E,Glutamate carboxypeptidase 2,Q04609
+9fm2,sabdab2_H05FTL0000,VHH,2025-07-09,A,,B,Neuraminidase,A0A5Q0MEI0
+8vtd,sabdab2_H04HAL03G4,Fab,2025-07-02,B,A,C,T-cell immunoreceptor with Ig and ITIM domains,Q495A1
+8yvk,sabdab2_H04YJL03SH,Fab,2025-07-02,E,F,A|B,Neuraminidase,A0A248T7C3
+8zyx,sabdab2_H059PL03SH,Fab,2025-07-02,F,J,C|D,Neuraminidase,A0A0N7G9M6
+9ccs,sabdab2_H05AGL041R,Fab,2025-07-02,C,B,A,Type 1 fimbiral adhesin FimH,P08191
+9iyy,sabdab2_H05D4L043P,Fab,2025-07-02,H,L,A|B,Large envelope protein,I7KIT3
+9kmi,sabdab2_H04WSL00SS,Fab,2025-07-02,H,L,A,Sodium- and chloride-dependent taurine transporter,O35316
+8rex,sabdab2_H04NML03K3,Fab,2025-06-25,G,F,C,Transforming growth factor beta-1 proprotein,P04202
+8yry,sabdab2_H05F4L0455,Fab,2025-06-25,H,L,A,Receptor tyrosine-protein kinase erbB-3,P21860
+9bt5,sabdab2_H04Y9L03SA,Fab,2025-06-25,C,D,A,Hemagglutinin,R4NN21
+9dlf,sabdab2_H055NL03YJ,Fab,2025-06-25,B,A,C,Arabinosyltransferase AftB,I4BQX4
+9dm7,sabdab2_H05BFL011A,Fab,2025-06-25,H,L,A,Mannosyltransferase,A0ABD7HTP3
+9jqu,sabdab2_H0560L03YR,Fab,2025-06-18,H,L,A,Envelopment polyprotein,A0A0B5A886
+9l2k,sabdab2_H05BVL042T,Fab,2025-06-18,H,L,A,Envelopment polyprotein,A0A1S6K8S9
+9dbo,sabdab2_H04VYL03QM,Fab,2025-06-11,H,L,C,Serine/threonine-protein kinase mTOR,P42345
+9fgx,sabdab2_H04XKL0000,VHH,2025-06-11,C,,D,GLYCEROL,P00698
+9odb,sabdab2_H05ZVL04GH,Fab,2025-06-11,B,C,D,"chicken IgY heavy chain,Ig-like domain-containing protein",A0A8V0XLK0
+8xa4,sabdab2_H04V9L03Q3,Fab,2025-06-04,C,D,A|B,Protein OPG161,A0A7H0DND2
+9ffv,sabdab2_H04XCL0000,VHH,2025-06-04,F,,A|E,Gamma-aminobutyric acid receptor subunit alpha-1,P14867+P28472
+8zeu,sabdab2_H05FRL045P,Fab,2025-05-28,A,B,C,Thymic stromal lymphopoietin,Q969D9
+9isf,sabdab2_H05A2L0000,VHH,2025-05-28,B,,A,Glycoprotein D,A0A181ZH04
+9ehl,sabdab2_H04YFL03SF,Fab,2025-05-21,G,J,A,"HIV-1 BG505 SOSIP gp120,Envelope glycoprotein gp120",Q2N0S5
+9mfg,sabdab2_H04Y4L0000,VHH,2025-05-21,E,,D,Interleukin-23 receptor,Q5VWK5
+9c2h,sabdab2_H061PL04HQ,Fab,2025-05-14,E,F,A|D,Nucleoprotein,P0DTC9
+9fns,sabdab2_H0561L03YS,Fab,2025-05-14,C,D,A,Secreted protein ORF2,Q9YLQ9
+9ggp,sabdab2_H05FWL045R,Fab,2025-05-14,H,L,A,Alpha-1-antitrypsin,P01009
+9kqc,sabdab2_H05XML0000,VHH,2025-05-14,B,,A,Hyaluronan synthase,M1H2Q1
+9qub,sabdab2_H05XJL04FB,Fab,2025-05-14,D,C,A,Sodium/hydrogen exchanger 9B2,Q86UD5
+9r2e,sabdab2_H05KSL048S,Fab,2025-05-14,A,B,Q,"1,2-ETHANEDIOL",P01876
+8zca,sabdab2_H053PL03X6,Fab,2025-05-07,C,B,E,Leukocyte surface antigen CD47,Q08722
+9b7g,sabdab2_H05ESL044Y,Fab,2025-05-07,H,L,A,Hemagglutinin,A0A2P1ADT1
+9c0x,sabdab2_H0595L040Y,Fab,2025-05-07,H,L,B,Hemagglutinin HA1 subunit,A0A6J3XB93
+8z8l,sabdab2_H04ZNL0000,VHH,2025-04-30,A,,B,Interleukin-4 receptor subunit alpha,P24394
+9cb5,sabdab2_H05CHL0439,Fab,2025-04-30,D,H,B,Nucleolin,P19338
+9ixv,sabdab2_H05XSL04FD,Fab,2025-04-30,H,L,A,Spike glycoprotein,K9N5Q8
+9hzj,sabdab2_H04YGL0000,VHH,2025-04-23,A,,B,Circumsporozoite protein,P19597
+9m7v,sabdab2_H05B1L0426,Fab,2025-04-23,H,L,A|B|C,Capsid protein VP1,B9VUU3
+9cy1,sabdab2_H050AL0000,VHH,2025-04-16,B,,A,Solute carrier organic anion transporter family member 1B1,Q9Y6L6
+9mr7,sabdab2_H052RL03WP,Fab,2025-04-16,J,I,C,Pertussis toxin subunit 3,P04979
+9mr7,sabdab2_H052SL03WQ,Fab,2025-04-16,H,G,A|E|F,Pertussis toxin subunit 1,P04977+P04981+P0A3R5
+8yyz,sabdab2_H054GL00FB,Fab,2025-04-09,H,L,A,Sonic hedgehog protein N-product,Q15465
+9dmv,sabdab2_H050DL03TR,Fab,2025-04-09,F,G,E,Acetylcholine receptor subunit beta,P11230
+9fjf,sabdab2_H05C1L0000,VHH,2025-04-09,C,,B,Lysosomal acid glucosylceramidase,P04062
+9hml,sabdab2_H052AL0000,VHH,2025-04-09,C,,B,KIR2DL protein,P43626
+9fik,sabdab2_H04VTL03QJ,Fab,2025-04-02,B,C,A,Neurotrophin-3,P20783
+8rew,sabdab2_H04NVL03KA,Fab,2025-03-26,G,F,A,Transforming growth factor beta-1,P01137
+9emy,sabdab2_H05EYL0000,VHH,2025-03-26,E,,A,non-specific serine/threonine protein kinase,A0A2I0BRS6
+8veb,sabdab2_H04PRL03M0,Fab,2025-03-19,G,I,E,2-acetamido-2-deoxy-beta-D-glucopyranose,A4U7A6
+9dpc,sabdab2_H051YL03VY,Fab,2025-03-19,H,L,D,Neuraminidase,A0A6H1QYJ4
+9h1f,sabdab2_H05EKL0000,VHH,2025-03-19,B,,A,Cofilin-1,P23528
+9j3j,sabdab2_H051WL0000,VHH,2025-03-19,B,,A,"ADP,ATP carrier protein 1, chloroplastic",Q39002
+9j3n,sabdab2_H04VXL0000,VHH,2025-03-19,B,,A,"ADP,ATP carrier protein 1",Q9Z8J2
+9myl,sabdab2_H05JQL0480,Fab,2025-03-19,A,B,D,Izumo sperm-egg fusion protein 1,Q9D9J7
+8rmx,sabdab2_H04JSL03H7,Fab,2025-03-12,B,C,A,Protein-glutamine gamma-glutamyltransferase E,Q08188
+8u1p,sabdab2_H04RTL03P9,Fab,2025-03-12,B,C,A,Gametocyte surface protein P45/48,Q8I6T1
+8yw6,sabdab2_H05WSL0000,VHH,2025-03-12,C,,B,Mitochondrial pyruvate carrier 2,O95563
+9azr,sabdab2_H00THL00QJ,Fab,2025-03-12,H,L,E,Hemagglutinin HA1 chain,Q07775
+9bjg,sabdab2_H05GDL0467,Fab,2025-03-12,H,L,A,Apical membrane antigen 1,P22621
+9dry,sabdab2_H05E7L044F,Fab,2025-03-12,E,F,A,E3 ubiquitin-protein ligase CHIP,Q9UNE7
+9h4r,sabdab2_H05FML045J,Fab,2025-03-12,H,L,A,Zona pellucida sperm-binding protein 2,P20239
+9j82,sabdab2_H057ML03ZV,Fab,2025-03-05,H,L,A,Putative zinc metalloprotease aq_1964,O67776
+9mnw,sabdab2_H04YEL0000,VHH,2025-03-05,C,,A,Mitochondrial pyruvate carrier 1,Q9Y5U8
+8w5d,sabdab2_H049FL03AP,Fab,2025-02-26,H,L,C|c,Minor capsid protein A1,P03615
+8w5l,sabdab2_H04FSL03EQ,Fab,2025-02-26,H,L,A|B|C,Minor capsid protein A1,Q8LTE1
+8y9z,sabdab2_H04B0L0000,VHH,2025-02-26,V,,E|Y,Protein translocase subunit SecE,A4IJH4+A4IJK8
+9dvq,sabdab2_H04YPL0000,VHH,2025-02-26,G,,A,"Antiplasmin-cleaving enzyme FAP, soluble form",Q12884
+8vkx,sabdab2_H04BXL03C3,Fab,2025-02-19,H,L,A,VP1,K4LM89
+9dm0,sabdab2_H04ZKL03T9,Fab,2025-02-19,C,D,A|B|G,Hemagglutinin,A0A1D5AK66+C3W5S1
+8rwb,sabdab2_H04Q2L03M6,Fab,2025-02-12,H,L,P,"1,2-ETHANEDIOL",Q5VY80
+8y9s,sabdab2_H04M5L0000,VHH,2025-02-12,B,,A,Albumin,P02768
+9gox,sabdab2_H05EAL044J,Fab,2025-02-12,H,L,A,ADP-ribosyl cyclase/cyclic ADP-ribose hydrolase 1,P28907
+9ljj,sabdab2_H05E8L0000,VHH,2025-02-12,M,,A|B,Heliorhodopsin,A0A2R4S913
+8tq4,sabdab2_H04MBL03J7,Fab,2025-02-05,C,D,E|F,H2 class I histocompatibility antigen D-d alpha chain (H2-Dd,P01887+P01900
+8tq5,sabdab2_H04THL03PM,Fab,2025-02-05,H,L,A|B,HLA class I histocompatibility antigen B alpha chain (HLA-B*,P61769+Q860B7
+8znz,sabdab2_H05APL041W,Fab,2025-02-05,G,H,B,5'-nucleotidase,P21589
+9dq3,sabdab2_H051TL03VW,Fab,2025-02-05,H,L,C,Cytotoxic T-lymphocyte protein 4,P16410
+9dq5,sabdab2_H047NL02BJ,Fab,2025-02-05,H,L,C,Cytotoxic T-lymphocyte protein 4,P09793
+9mj4,sabdab2_H056PL0000,VHH,2025-02-05,Q,,B,V-type proton ATPase subunit d,P32366
+8v13,sabdab2_H04S1L03NG,Fab,2025-01-29,H,L,T,SODIUM ION,P01416
+9e60,sabdab2_H056DL03Z3,Fab,2025-01-29,H,L,A,Capsid protein 2,Q03726
+9e89,sabdab2_H05EJL044S,Fab,2025-01-29,H,L,A,Capsid protein,A0A2S0SZA2
+8tii,sabdab2_H04BRL029X,Fab,2025-01-22,H,L,A,Beta-arrestin-1,P17870
+8vqf,sabdab2_H04MCL03J8,Fab,2025-01-22,B,A,C,Major allergen Can f 1,O18873
+8z4e,sabdab2_H052WL03WS,Fab,2025-01-22,C,B,A,Neuraminidase,A0A884WLQ3
+8z74,sabdab2_H04WXL0000,VHH,2025-01-22,A,,C,"Soluble cytochrome b562,Apelin receptor",P35414
+9g95,sabdab2_H04YYL0000,VHH,2025-01-22,B,,A,Lipid III flippase,P0AAA7
+9ind,sabdab2_H04WEL03R0,Fab,2025-01-22,H,L,B,Integrin beta-8,P26012
+8rl7,sabdab2_H04JQL0000,VHH,2025-01-15,B,,A,Sphingosine-1-phosphate transporter SPNS2,Q8IVW8
+9bp1,sabdab2_H04YNL03SK,Fab,2025-01-15,A,B,E|I,Envelope glycoprotein gp160,A0A4Y5TJX4
+9cq4,sabdab2_H0088L04JF,Fab,2025-01-15,C,D,F,T-cell surface glycoprotein CD3 epsilon chain,P07766
+9j7y,sabdab2_H05DJL0000,VHH,2025-01-15,H,,G,Entry-fusion complex associated protein OPG095,M1LBP0
+8zhq,sabdab2_H04W2L03QR,Fab,2025-01-08,D,A,E,Envelopment polyprotein,A0A1S6XXJ1
+8zr4,sabdab2_H05FCL045B,Fab,2025-01-01,A,B,D,2-acetamido-2-deoxy-beta-D-glucopyranose,A0A2S0X6Y5
+9h76,sabdab2_H04XRL0000,VHH,2025-01-01,B,,A,Putative amino acid/polyamine transport protein,A8UCQ5
+8qgx,sabdab2_H048TL0000,VHH,2024-12-25,B,,A,Neutrophil elastase,P08246
+8si1,sabdab2_H04B5L03BN,Fab,2024-12-25,B,A,F,Conglutin,Q647G9
+8sj6,sabdab2_H048QL03A3,Fab,2024-12-25,A,B,Q,Ara h 2 allergen,Q6PSU2
+8t6m,sabdab2_H04KHL03HS,Fab,2024-12-25,B,A,E,JTK191b_L02_Light,I3QHR3
+8t7r,sabdab2_H048CL039T,Fab,2024-12-25,B,A,C,MHC class I antigen (Fragment),F6IQR9
+8ume,sabdab2_H04P3L03KH,Fab,2024-12-25,D,F,A,Hemagglutinin,A0A076G8X7
+8ybl,sabdab2_H04EWL0000,VHH,2024-12-25,B,,A,Enterotoxin type B,P01552
+9cbn,sabdab2_H0580L0404,Fab,2024-12-25,A,B,C|D,Structural protein,O12792
+8s6z,sabdab2_H04D7L03D4,Fab,2024-12-18,A,B,C,IMIDAZOLE,P10747
+8v93,sabdab2_H047TL0399,Fab,2024-12-18,B,L,D,"Type 1 fimbrin D-mannose specific adhesin FimH, Donor strand",P08190
+8vc7,sabdab2_H048FL011A,Fab,2024-12-18,B,A,E,Butyrophilin subfamily 2 member A1,Q7KYR7
+8yvj,sabdab2_H04XWL0000,VHH,2024-12-18,A,,B,Toxin A,P16154
+9bsu,sabdab2_H0593L0000,VHH,2024-12-18,D,,C,Envelope glycoprotein,Q05320
+9jqt,sabdab2_H04YZL03SR,Fab,2024-12-18,B,C,A,Cytokine receptor common subunit gamma,P31785
+8v5q,sabdab2_H04SFL03NW,Fab,2024-12-11,H,L,G,DI(HYDROXYETHYL)ETHER,P09259
+8vti,sabdab2_H04HJL03GA,Fab,2024-12-11,D,C,A,Adhesion G protein-coupled receptor L3,Q9HAR2
+8y4w,sabdab2_H04N6L0000,VHH,2024-12-11,B,,A,N-acetylneuraminate transporter small subunit,Q8RDN8
+9b2m,sabdab2_H050YL03V6,Fab,2024-12-11,E,F,A|B,Hemagglutinin HA1 chain,Q6WG00
+9ert,sabdab2_H04XSL0000,VHH,2024-12-11,B,,A,"2',3'-cyclic-nucleotide 3'-phosphodiesterase",P16330
+8jkh,sabdab2_H04TSL03PS,Fab,2024-12-04,H,L,A|a,NS1,A0A1B3ZSF4
+8y31,sabdab2_H049NL03AV,Fab,2024-12-04,B,A,E,Interferon alpha/beta receptor 1,P17181
+9dh2,sabdab2_H05GPL046G,Fab,2024-12-04,A,D,M|R,NKG2-D type II integral membrane protein,P26718
+9dwe,sabdab2_H05FXL013E,Fab,2024-12-04,H,L,C,2-acetamido-2-deoxy-beta-D-glucopyranose,A0A8E4ZAK5
+8uzc,sabdab2_H04R3L03MX,Fab,2024-11-27,H,L,A,Hemagglutinin,A0A2R4U351
+8zd5,sabdab2_H052NL03WJ,Fab,2024-11-27,B,C,A,Superoxide dismutase [Cu-Zn],Q8WNN6
+9bu6,sabdab2_H05GNL046F,Fab,2024-11-27,A,B,D,Hemagglutinin HA2,A0A0B4UV34
+9f6o,sabdab2_H057ZL0000,VHH,2024-11-27,B,,A,Natural resistance-associated macrophage protein 2,P49281
+8p12,sabdab2_H04FTL03ER,Fab,2024-11-20,H,L,B,Guanine nucleotide-binding protein G(I)/G(S)/G(T) subunit be,P62871
+8p13,sabdab2_H04QEL03MG,Fab,2024-11-20,H,L,A,Guanine nucleotide-binding protein G(i) subunit alpha-1,P63096
+8rwf,sabdab2_H04RBL0000,VHH,2024-11-20,C,,B,S-layer protein sap,P49051
+9b9y,sabdab2_H04ZQL0000,VHH,2024-11-20,N,,R,"Cannabinoid receptor 1,Glycogen synthase",P21554
+9bif,sabdab2_H05AYL0423,Fab,2024-11-20,C,D,A|B,Outer surface protein C,Q07337
+9e6k,sabdab2_H04Z7L03SZ,Fab,2024-11-20,H,L,C,Disintegrin and metalloproteinase domain-containing protein ,P78536
+8qz6,sabdab2_H04HML0000,VHH,2024-11-13,B,,A,Ceramide synthase 6,Q6ZMG9
+8uwz,sabdab2_H04JWL03H9,Fab,2024-11-13,A,B,E,"Vascular endothelial growth factor A, long form",P15692
+8wz5,sabdab2_H04JYL03HB,Fab,2024-11-13,D,F,B,RSV Fusion glycoprotein,P13843
+8zre,sabdab2_H057QL03ZY,Fab,2024-11-13,H,L,C|D,Capsid protein,A0A0D4D698
+9b2c,sabdab2_H0543L03XF,Fab,2024-11-13,H,L,A,Spike glycoprotein,A0A1S6L971
+9bdf,sabdab2_H05G8L0463,Fab,2024-11-13,B,I,H,2-acetamido-2-deoxy-beta-D-glucopyranose,A0A8F5JT24
+9bio,sabdab2_H05VHL04DR,Fab,2024-11-13,H,L,B|G,Envelope glycoprotein gp41,A0A0R6CVA7+Q1M0K6
+9dx6,sabdab2_H05DBL043W,Fab,2024-11-13,B,C,A,Apical merozoite protein 1,B9TXF7
+8s79,sabdab2_H04RNL0000,VHH,2024-11-06,C,,B,Nod-factor receptor 5,Q70KR1
+8ulj,sabdab2_H04KYL03J2,Fab,2024-11-06,H,L,B,"Fusion glycoprotein F0,Fibritin",A0A088S9A7
+8vgo,sabdab2_H04JTL03H8,Fab,2024-11-06,A,B,G|I,B-lymphocyte antigen CD20,P11836
+8wz4,sabdab2_H04EFL03DW,Fab,2024-11-06,H,L,C,RSV Fusion glycoprotein,P03420
+8ywq,sabdab2_H057CL03ZQ,Fab,2024-11-06,H,L,A,Interleukin-6,P05231
+9fvb,sabdab2_H051VL0000,VHH,2024-11-06,C,,A,Sialic acid-binding periplasmic protein SiaP,Q9KR64
+8us0,sabdab2_H04N4L03JQ,Fab,2024-10-30,B,C,A,Hemagglutinin,M1UPL4
+8us8,sabdab2_H04AQL03BE,Fab,2024-10-30,A,B,R,SULFATE ION,P13830
+8vgi,sabdab2_H049YL03AY,Fab,2024-10-30,F,E,C,Tryptase alpha/beta-1,Q15661
+8vgp,sabdab2_H04DWL03DG,Fab,2024-10-30,H,L,A,Angiopoietin-2,O15123
+8vgq,sabdab2_H04C5L03CA,Fab,2024-10-30,H,L,A,GTPase KRas,P01116
+9fww,sabdab2_H056EL0000,VHH,2024-10-30,B,,A,Natural cytotoxicity triggering receptor 3,O14931
+9g6v,sabdab2_H061RL0000,VHH,2024-10-30,E,,B|C|H,Genome polyprotein,Q719N0
+9jub,sabdab2_H05B2L0427,Fab,2024-10-30,B,C,A,Hyaluronidase PH-20,P38567
+9gwt,sabdab2_H04XGL03RW,Fab,2024-10-23,H,L,P,Cell surface glycoprotein CD200 receptor 1,Q8TD46
+8rek,sabdab2_H04G3L03EZ,Fab,2024-10-16,H,L,A,Apical membrane antigen 1 (Fragment),A5K4Z2
+8udr,sabdab2_H04SGL03NX,Fab,2024-10-16,D,E,A,"HLA class I histocompatibility antigen, A alpha chain",P04439
+8up2,sabdab2_H04Q1L03M5,Fab,2024-10-16,A,B,C,"Factor H binding protein, sequence variant ID 1",Q9JXV4
+9au1,sabdab2_H05D6L03BW,Fab,2024-10-16,H,L,R,4-(2-HYDROXYETHYL)-1-PIPERAZINE ETHANESULFONIC ACID,A0A8A5XRG7
+9bia,sabdab2_H05ZPL0000,VHH,2024-10-16,E,,B|D,Ninjurin-1,O70131
+8v5l,sabdab2_H049BL03AJ,Fab,2024-10-09,B,C,A,Envelope glycoprotein E,A6XEF7
+8s4u,sabdab2_H04QKL0000,VHH,2024-10-02,B,,A,Thiamine transporter 2,Q9BZV2
+8vgv,sabdab2_H04TNL03PQ,Fab,2024-10-02,C,D,A,CH848 DE3 SOSIP gp120,A0A1W6IPB2
+8vh1,sabdab2_H04QRL03MP,Fab,2024-10-02,C,D,A,CH505.M5 SOSIP gp120,M4M0W3
+8qj2,sabdab2_H04MNL0000,VHH,2024-09-25,D,,A,"Soluble cytochrome b562,Melanocortin receptor 4,Red fluoresc",P0ABE7
+8weo,sabdab2_H04QXL0000,VHH,2024-09-25,C,,B,Fragilysin,P54355
+8wcg,sabdab2_H04G0L0000,VHH,2024-09-18,E,,A,Spike protein S1,P59594
+8xps,sabdab2_H048NL0000,VHH,2024-09-18,B,,A,Nipah virus Bangladesh string G protein,Q4VCP5
+8tv5,sabdab2_H04S7L03D7,Fab,2024-09-11,A,B,C,Ephrin type-A receptor 2,P29317
+8tx3,sabdab2_H04JAL03GX,Fab,2024-09-11,E,J,A|B,Hemagglutinin,L0HR89
+8ukh,sabdab2_H04R9L03N1,Fab,2024-09-11,H,L,A|B,Cell traversal protein for ookinetes and sporozoites,Q8I5P1
+8ulf,sabdab2_H04JML03H4,Fab,2024-09-11,H,L,A|B,Pv cell-traversal protein,Q53UB7
+8ysf,sabdab2_H05E0L0000,VHH,2024-09-11,C,,B,Spike glycoprotein,R9UQ53
+8yxi,sabdab2_H051SL03VV,Fab,2024-09-11,C,B,A,Envelopment polyprotein,A0A2Z4HIM0
+8zoy,sabdab2_H051CL0000,VHH,2024-09-11,B,,A,Sodium-dependent noradrenaline transporter,P23975
+9clp,sabdab2_H058PL040N,Fab,2024-09-11,H,L,A,Zinc metalloproteinase-disintegrin-like ecarin,Q90495
+9ima,sabdab2_H0538L03X2,Fab,2024-09-11,C,D,A,G-protein coupled receptor family C group 5 member D,Q9NZD1
+9jbq,sabdab2_H058JL040J,Fab,2024-09-11,A,B,C,PcrV,G3XD49

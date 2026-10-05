@@ -1,0 +1,61 @@
+# B0.b, Best-of-N sweep over BOTH scaling axes: trunk seeds x diffusion samples.
+#
+# The two ways to spend a fixed budget: more TRUNK seeds (MSA subsamples, expensive, one trunk
+# each) or more DIFFUSION samples (cheap, shared trunk). The sweep is seeds in {1,5,10,20} x
+# samples in {1,5,10,50,100}, read as the Pareto frontier of DockQ against compute.
+#
+# This config is the MAXIMUM cell, 20 seeds x 50 samples per seed. Every smaller
+# (S,M) cell is recovered by subsetting the SAME structures in the eval
+# (`evaluate.py --summary-seed-subsets 1,5,10,20 --summary-sample-subsets 1,5,10,50`),
+# so all 16 cells are cut from one identical pool. The eval also reports each cell's
+# trunk-vs-diffusion compute so seed-scaling and sample-scaling are compared at matched FLOPs,
+# not just matched candidate count (20 seeds x 1 sample and 1 seed x 20 samples both = 20
+# candidates but cost 20 trunks against 1 trunk).
+#
+# Trunk = MSA random subsample at d=1000 (full working depth), ranking_score verifier.
+# STORAGE: ipSAE keeps a PAE (~1.1 MB) per sample, and the pipeline saves all PAE before
+# scoring, so peak disk is about n_seeds * n_samples * 52 * 1.1 MB. At 20 x 100 that is ~114 GB,
+# at 20 x 50 it is ~57 GB, which is why samples cap at 50 (eval subsets {1,5,10,50}).
+# The 100/500/1000 columns need seed-chunked runs, with clean PAE between chunks.
+#
+#   python -m experiments.scripts.run_ablation --config experiments/configs/baseline/b0b.yaml
+
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/b0b
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/b0b
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+
+model:
+  backend: protenix2
+  seeds: [101]                         # fixed diffusion RNG (the seed axis is the MSA subsample)
+  run:
+    n_cycles: 10
+    n_samples_per_seed: 50             # pilot MAX diffusion samples/seed; eval subsets {1,5,10,50}
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:                     # trunk seed axis, 20 random d=1000 subsamples
+                                       # (eval subsets {1,5,10,20})
+      policy: random
+      depth: 1000
+      n_seeds: 20
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true         # ipSAE needs PAE
+
+verifier:
+  rank_by: ranking_score               # Best-of-N selection verifier, the model's
+                                       # 0.8*ipTM + 0.2*pTM. The PAE panel
+                                       # (ipSAE/pDockQ2/LIS/iLIS) is still computed per sample.
+  ipsae: { pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0 }
+
+method:
+  diffusion_side: best_of_n
+  label: b0b

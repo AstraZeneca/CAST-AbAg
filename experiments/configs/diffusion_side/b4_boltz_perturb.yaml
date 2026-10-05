@@ -1,0 +1,113 @@
+# BOLTZ-PERTURB baseline.
+#
+# Token Conditioning Perturbation (TCP) and Token Bias Perturbation (TBP) on the denoiser's
+# conditioning, ported step-for-step from MSDLLCpapers/boltz-perturb
+# (`src/boltz/model/modules/diffusionv2.py`: make_s_noise_fn, make_token_bias_noise_fn) into
+# method/diffusion_side/boltz_perturb.py. The port decisions -- ligand -> antibody, their token
+# embeddings/transition bias -> the s_trunk/pair_z here, and TADS applied to the schedule fraction
+# because the sampler's noise variance is not exposed at the hook point -- are listed in that
+# file's header and are the ONLY departures from the source.
+#
+# A BASELINE, NOT AN ABLATION: an external published method attacking the same failure by a
+# different route, adding diversity to the conditioning and using no site information at all.
+#
+# THE FIELDS BELOW SAY "NO SEARCH", AND EVERY ONE OF THEM IS LOAD-BEARING:
+#     algorithm: fk         installs the coupled-particle hook (which is what applies the
+#                           perturbation), it does NOT make this an FK run -- see the next three
+#     guidance_scale: 0.0   no reward gradient
+#     lam: 0.0              the FK increment is exp(0 * dr) = 1, so weights never leave uniform,
+#                           ESS never drops and resampling NEVER fires
+#     lam_adaptive: false   lambda is not solved from the reward spread (which would read the reward)
+#     reward: ipsae         never computed -- see below -- and deliberately NOT a site reward, so
+#                           this arm needs no epitope map and cannot be accused of using one
+# Together these make `spec.reward_affects_sampling()` return False (diffusion_search.py:815), so the
+# hook SKIPS scoring entirely: no mini-rollout, no confidence pass, no reward. That is not a
+# micro-optimisation -- scoring is ~9% of a run's denoiser work, and charging it to a baseline that
+# never reads the number would overstate the baseline's FLOPs (M4) and understate its efficiency.
+# Skipping is safe for reproducibility because the mini-rollout is deterministic and draws no random
+# numbers, so it cannot shift the RNG stream.
+#
+# WHAT THIS ARM MUST BE COMPARED AGAINST, and it is NOT the stock Best-of-N control. The coupled
+# particle sampler draws ONE coupled trajectory over the population where stock Protenix draws an
+# independent one per chunk, and that difference alone scores stronger than b0b at matched budget.
+# So the matched control for this arm is THE SAME
+# CONFIG WITH boltz_perturb_enabled=false -- the `bpoff` arm in jobs/tts-baseline-pool.yaml. Reporting
+# `bp` against stock BoN would credit the sampler change to Boltz-Perturb.
+#
+# BUDGET: 1 seed x 720 samples, matching CAST's POOL (its 723 emitted include K-1 unsteered trunk
+# by-products, excluded from M1/M2/M5 by results_io.pool_rows) and the FK/TDS baselines.
+# ONE seed is the right arrangement, not a handicap: Boltz-Perturb's entire claim is that it buys
+# diversity from PERTURBATION rather than from extra conditionings, so giving it K MSA subsamples
+# would test a different method. State the arrangement when reporting it.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/b4_boltz_perturb
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/b4_boltz_perturb
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    n_samples_per_seed: 180             # = CAST's POOL. Not 723: K-1 of CAST's 723 are unsteered
+                                        # trunk by-products, excluded from M1/M2/M5 by
+                                        # results_io.pool_rows, so 720 is the matched number.
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1                   # mandatory: the coupled particle pool is single-process
+    msa_subsample:
+      policy: random
+      depth: 1000
+      n_seeds: 4                        # ONE conditioning -- see BUDGET above
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  diffusion_side: guidance              # the FAMILY that owns the coupled-particle hook
+  label: b4_boltz_perturb
+  diffusion_search:
+    algorithm: fk
+    reward: none                        # NO OBJECTIVE. Was `ipsae`, which was never computed but
+                                        # read as though this arm optimised ipSAE. `none` says it
+                                        # outright: reward_affects_sampling() is False for it and
+                                        # the reward builder RAISES if anything tries to score it.
+    subsample_pool: 1
+    weight_level_correction: false
+    umbrella_sweep: ""                  # no stratification: there is nothing to stratify OVER
+    guidance_scale: 0.0
+    lam: 0.0
+    lam_adaptive: false
+    potential: difference
+    resample: ess
+    ess_fraction: 0.5                   # unreachable at lam=0 (weights stay uniform, ESS = N)
+    resample_scheme: systematic
+    schedule_every: 20
+    physicality_filter: false
+    phys_use_clash: false
+    phys_use_plddt: false
+    mini_rollout_steps: 4               # inert: no scoring event ever runs a rollout
+    # ---- BOLTZ-PERTURB. Every value here is the reference implementation's own default.
+    boltz_perturb_enabled: true
+    # BOTH TRACKS, which is what the source runs. The single-track arms (bptcp / bptbp in the pool
+    # template) exist to attribute a result to one of them, this file is the method as published.
+    boltz_perturb_tcp: true             # perturb s_trunk (their token embeddings)
+    boltz_perturb_tbp: true             # perturb pair_z  (their token transition bias)
+    boltz_perturb_noise_scale: 0.3
+    boltz_perturb_psi: 0.7              # mixes toward the ORIGINAL, so psi=0 is the identity
+    boltz_perturb_rescale: true
+    boltz_perturb_norm_proj: true
+    # cross_and_ll = every pair touching the antibody, their default with ligand -> antibody.
+    # cross_only (antibody x antigen) is the block that carries "where does the antibody sit", it is
+    # a legitimate sweep, but it is OURS, so it is not what this baseline runs.
+    boltz_perturb_mode: cross_and_ll
+    boltz_perturb_tads: true            # anneal the noise scale, full early -> floor late
+    boltz_perturb_tads_floor: 0.0

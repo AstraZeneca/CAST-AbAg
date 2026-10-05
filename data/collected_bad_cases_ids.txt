@@ -1,0 +1,60 @@
+# Collected bad cases, 52 target PDB ids.
+# see data/datasets/collected_bad_cases.py for what they are.
+#
+# hard21  the 21 the paper scales CAST on, N=180K. Cases still below the CAPRI-medium
+#         threshold of 0.49 after a 1000-seed Protenix-v2 Best-of-N run.
+# hard31  the 31 an earlier 100-seed Best-of-N run left unsolved.
+#
+# target_id   hard21  hard31
+8yvk_ab1        -       yes
+9atr_nb2        -       yes
+9e3k_ab2        yes     -
+9e3l_ab3        -       yes
+9eba_nb3        -       -
+9ejf_ab2        yes     yes
+9eyd_nb1        -       -
+9h6v_nb3        yes     -
+9h77_nb1        yes     yes
+9hll_nb1        yes     yes
+9hls_nb11       yes     yes
+9iar_nb1        -       -
+9ias_nb1        -       -
+9irc_ab1        -       -
+9iz9_ab4        -       yes
+9j4c_ab1        -       -
+9j93_ab1        -       -
+9jmr_ab1        -       -
+9jno_ab1        -       yes
+9kkj_ab1        yes     yes
+9kod_ab3        -       yes
+9l1o_ab1        -       yes
+9lsz_ab1        -       -
+9ly5_ab1        -       -
+9ly6_ab1        yes     yes
+9mla_ab2        yes     yes
+9n6e_ab3        yes     yes
+9n8j_ab2        -       yes
+9nj3_ab3        -       yes
+9nja_ab1        -       yes
+9npg_ab1        -       -
+9nrc_ab1        yes     yes
+9nsd_nb2        -       yes
+9nsd_nb3        -       yes
+9nww_ab1        yes     yes
+9og1_ab1        yes     yes
+9p8x_ab1        yes     yes
+9puo_ab3        yes     yes
+9pv3_ab1        -       yes
+9pym_nb1        -       yes
+9qt3_ab10       yes     yes
+9r0j_nb1        yes     yes
+9rxi_nb2        -       yes
+9s36_nb1        -       -
+9uy9_ab3        -       -
+9uza_ab2        yes     yes
+9vnp_ab1        -       -
+9xqb_ab1        yes     -
+9xsx_ab1        -       -
+9xth_ab1        -       -
+9yc3_nb1        yes     -
+9yc5_ab1        yes     -

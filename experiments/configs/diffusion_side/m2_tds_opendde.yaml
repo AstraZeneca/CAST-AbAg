@@ -1,0 +1,133 @@
+# TDS (Wu et al. 2306.17775) on the OpenDDE backend, the same twisted-proposal steering as
+# m2_tds.yaml, driving a SECOND co-folding model.
+#
+# Everything under `method` is copied from m2_tds.yaml UNCHANGED so the two backends are steered
+# identically, the long calibration commentary lives there and is not duplicated. Only the `model`
+# block differs. If m2_tds.yaml's calibration changes, change it here too, the scale 75 / clip 700
+# pairing and the epitope umbrella set are a matched calibration, never independent knobs.
+#
+# PUBLIC SOURCE. OpenDDE is https://github.com/aurekaresearch/OpenDDE (Apache-2.0), installed from
+# PyPI as `pip install "opendde[gpu]==1.1.0"` with weights from
+# https://huggingface.co/aurekaresearch/OpenDDE (opendde_abag.pt, the antibody-antigen checkpoint).
+# OPENDDE_ROOT_DIR points at the tree holding .venv, checkpoint/ and common/. models/opendde.py
+# carries the full staging recipe. Pin the version: upstream is a preview release and a moved attach point
+# leaves the run UNSTEERED rather than failing.
+#
+# HOW THE HOOK REACHES OPENDDE: OpenDDE ships in its own venv, so a steered run does NOT call the
+# console script. models/opendde.py routes it through models/_opendde_launch.py, executed by the
+# OPENDDE venv's python with this repo on PYTHONPATH and TTS_COFOLD_PKG=opendde, which attaches the
+# diffusion-side hook to OpenDDE.sample_diffusion before the model is built.
+#
+# The hook is verified at the GRADIENT level on OpenDDE, not merely attached: a steered run logs
+# "reward gradient APPLIED at N steps" with a non-zero cumulative displacement where the matching
+# Best-of-N run logs none, so the tilt moves an OpenDDE sample the way it moves a Protenix one.
+
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m2_tds_opendde
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m2_tds_opendde
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+
+model:
+  backend: opendde
+  seeds: [101]
+  run:
+    n_cycles: 10
+    # BUDGET SHAPE IS FORCED -- 1 seed x N samples, not 20 x 50.
+    # With the hybrid map pinned above (12-15 candidate sites) and 4 umbrellas, the cell grid is 60
+    # cells, and check_cell_budget returns "error" below ~360 particles PER SEED: at 50 it reported
+    # "10 cell(s) end up with NO tilted particle", i.e. those binding hypotheses are never steered
+    # and the run completes anyway. The old 20x50 default was also 1000 structures, over this
+    # project's 780 ceiling.
+    #
+    # THIS IS THE SEPARATE MODEL'S REAL CONSTRAINT, not a tuning choice. At a fixed 720 total it
+    # cannot have both several latents AND a populated cell grid: 2 seeds would leave 360 particles
+    # each, 4 would leave 180 (3 per cell). So the separate model buys latent diversity by starving
+    # the site sweep. That is precisely what the joint pool (m5_cast.yaml) exists to avoid: K latents
+    # share ONE 720-particle filter, so the grid stays at 12 per cell whatever K is.
+    # The pool job templates pass n_seeds and n_samples_per_seed explicitly on every arm, so these
+    # defaults bind only for a bare `--config` run.
+    # 720 divides the grid exactly: 60 cells x 12 particles, and at K=4 the latent allocation is
+    # [180,180,180,180]. 780 remains the project CEILING, this is the operating point under it.
+    # Note K=5 does NOT fit here: 12//5 = 2 per latent per cell, below the floor check_cell_budget
+    # enforces.
+    n_samples_per_seed: 720
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:
+      policy: random
+      depth: 1000
+      n_seeds: 1
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  opendde:
+    model_name: opendde_v1
+    root_dir: ${env:OPENDDE_ROOT_DIR}
+    abag: true
+    executable: ${env:OPENDDE_BIN,opendde}
+    # venv_python is DERIVED from executable (<venv>/bin/opendde -> <venv>/bin/python), set it here
+    # only if that venv puts its interpreter somewhere else.
+    venv_python: ${env:OPENDDE_PYTHON,""}
+    need_atom_confidence: true         # PAE gate, without it ipSAE/pDockQ2/LIS/iLIS score nothing
+    trimul_kernel: auto                # NEVER 'torch': 40.55 GiB alloc / OOM vs 19.7 GiB on auto
+    triatt_kernel: auto
+    enable_tf32: true
+    enable_fusion: true
+    enable_cache: true
+
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+
+method:
+  diffusion_side: guidance
+  label: m2_tds_opendde
+  diffusion_search:
+    algorithm: tds
+    reward: epitope
+
+    # DEPLOYABLE MAP IS THE DEFAULT, and the builder is PINNED so it cannot silently change.
+    # `epitope_source` only says oracle-vs-predicted, it collapses every predictor to "predicted",
+    # so a hybrid pool-mode+tile map, a DiscoTope-3 map and a surface-tile map are indistinguishable
+    # in the spec, the label and the results. `epitope_map_builder` names the CONSTRUCTION, and
+    # tts_job_lib.py:405 refuses to run when it disagrees with the map's own `_builder` stamp -- so
+    # handing this config a DiscoTope or ensemble map now fails preflight instead of running as
+    # something other than what the results will claim. hybrid_modes_tiles = coverage from an
+    # exhaustive surface tiling, ordering from the unsteered pool's own binding modes, no ground
+    # truth anywhere in it.
+    # For an ORACLE upper bound set epitope_source=ground_truth on the command line; do not edit
+    # this file, because then every run of it stops being the deployable number.
+    epitope_source: predicted
+    epitope_map_builder: hybrid_modes_tiles
+    sweep_units: centroid_A
+    rmsd_subset: paratope
+    guidance_scale: 75.0
+    guidance_max_norm: 0                # zeroed, guidance_max_rms_a overrides it
+    umbrella_sweep: "9,11,13,15"
+    # early2 resample window. Non-empty resample_windows OVERRIDES
+    # resample_start_frac/resample_end_frac, and the umbrella default above is calibrated under
+    # this window.
+    resample_windows: "0.25:0.35"
+    # PINNED TO MATCH THE JOB TEMPLATE (SITE_HINGE=true, SITE_HUBER=4.0). The dataclass defaults are
+    # False / 0.0, so a bare `--config` run without these two keys computes a DIFFERENT reward. The
+    # dataclass keeps the conservative off-values on purpose, so that older configs stay
+    # bit-identical.
+    site_hinge: true
+    site_huber_delta: 4.0
+    guidance_max_rms_a: 6.0             # AUTO (size-invariant) clip, the equivalent of the absolute
+                                        # 700 it replaces at this target size
+    lam_adaptive: true
+    target_ess_frac: 0.4
+    potential: difference
+    resample: ess
+    ess_fraction: 0.5
+    resample_scheme: systematic
+    schedule_every: 20
+    schedule_start_frac: 0.25           # pairs with resample_windows 0.25:0.35; 0.5 makes them DISJOINT
+    physicality_filter: false
+    phys_use_clash: false
+    phys_use_plddt: false
+    mini_rollout_steps: 4

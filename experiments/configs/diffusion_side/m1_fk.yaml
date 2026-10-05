@@ -1,0 +1,112 @@
+# FK / SMC (Singhal et al. 2501.06848) with a QUALITY reward.
+# Canonical per-method config: reward/repulsion as specified, no blending.
+#
+# ONE UMBRELLA AT d* = 12 A, not the 4-value sweep. The preflight refuses a sweep for fk, which
+# only SELECTS and so cannot drive particles apart the way TDS's transport can. 12 A is the centre
+# of the native paratope-epitope separations, the same value the single-umbrella CAST ablation uses.
+# The consequence: fk is stratified over SITES but not over DISTANCES, where tds and cast are
+# stratified over both.
+paths:
+  inputs_dir:       ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  predictions_dir:  ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/predictions/m1_fk
+  results_dir:      ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/results/m1_fk
+  ground_truth_dir: ${env:FOLDBENCH_ROOT}/ground_truths
+model:
+  backend: protenix2
+  seeds: [101]
+  run:
+    n_cycles: 10
+    n_samples_per_seed: 180             # = N particles, matched to CAST's pool. The job template
+                                        # overrides this per arm, pinned here so a bare
+                                        # `--config m1_fk.yaml` run is matched too.
+    n_diffusion_steps: 200
+    use_msa: true
+    use_template: false
+    nproc_per_node: 1
+    msa_subsample:                     # 20 MSA subsamples (block form; matches b0b); each runs a coupled population (the diffusion axis)
+      policy: random
+      depth: 1000
+      n_seeds: 4
+      seed: 0
+      chain_filter: null
+      source_inputs_dir: ../../../runs/${env:PROTEIN_TTS_DATASET,foldbench}/inputs
+  protenix2:
+    model_name: protenix-v2
+    component_path: ${env:PROTENIX_COMPONENT_PATH}
+    root_dir: ${env:PROTENIX_ROOT_DIR}
+    need_atom_confidence: true
+verifier:
+  rank_by: ranking_score
+  ipsae: {pae_cutoff_A: 10.0, dist_cutoff_A: 10.0, plddt_cutoff: 0.0}
+method:
+  diffusion_side: guidance
+  label: m1_fk
+  diffusion_search:
+    algorithm: fk             # reward + importance weights + resampling, NO gradient
+    # ALIGNED TO m2_tds.yaml SO THIS ARM IS A CONTROLLED CELL, NOT A LOOSE REFERENCE.
+    # Singhal et al. verbatim would be reward=ipsae, umbrella_sweep="", resample_scheme=multinomial,
+    # schedule_start_frac=0.5 and the absolute clip. That is faithful, but it differs from CAST on
+    # SIX axes at once, so an fk-vs-tds or fk-vs-cast gap could not be attributed to the missing
+    # gradient -- it would also carry a different reward, a different stratification, a different
+    # resampler and a different schedule.
+    #
+    # FOUR STATED DIFFERENCES FROM m2_tds.yaml, and no others. Everything else matches field for
+    # field, so an fk-vs-tds gap is attributable to these four and nothing hidden:
+    #     algorithm         fk vs tds          -- no twisted proposal (`uses_twisted_proposal()` is
+    #                                             False for fk regardless of guidance_scale, and
+    #                                             False for tds at guidance_scale=0; the two routes
+    #                                             to this cell are behaviourally identical, see
+    #                                             diffusion_search.py:854)
+    #     guidance_scale    0.0 vs 75.0        -- the same thing said in the spec
+    #     umbrella_sweep    "12" vs "9,11,13,15" -- ONE d* against four, see the header
+    #     resample_windows  ""  vs "0.25:0.35" -- 6 resample events against 2, see below
+    # The last two are NOT sloppiness: each is a property of what FK is, and forcing either to match
+    # would be a strawman rather than a control. State all four wherever the fk row is reported.
+    #
+    # WHAT THIS COSTS: this is no longer FK-as-published. It is an FK-style reweight and resample
+    # adapted to the site reward, not a reproduction of the paper. If a faithful reference run is
+    # ever needed, restore reward=ipsae / umbrella_sweep="" / resample_scheme=multinomial /
+    # schedule_start_frac=0.5 and label it separately.
+    reward: epitope                     # was ipsae -- MUST match CAST's objective to be comparable
+    umbrella_sweep: "12"                # ONE d*, not the 4-value sweep -- see the header. A sweep is
+                                        # refused for fk (it selects, it does not transport); a single
+                                        # stated d* is the plain scalar reward the method has.
+    epitope_source: predicted
+    epitope_map_builder: hybrid_modes_tiles
+    subsample_pool: 1                   # SEPARATE arrangement; the joint pool is CAST's axis
+    weight_level_correction: false      # forced False at K=1 anyway (diffusion_search.py:744)
+    rmsd_subset: paratope
+    sweep_units: centroid_A
+    # RESAMPLING IS FK'S ENTIRE MECHANISM, so it does NOT inherit CAST's narrow window.
+    # CAST and TDS resample at 2 events but also run a twisted proposal at ~159 of 200 steps. FK has
+    # no proposal at all. Giving it the same 2-event window leaves it 2 selection opportunities
+    # against TDS's 159 proposal steps plus 2, which is a strawman, not a control. Empty falls back
+    # to resample_start_frac/end_frac = 0.2/0.8 -> 6 eligible events of the 8 on the schedule, which
+    # is the setting this config shipped with and FK's own natural operating point.
+    # THE ONE-KNOB "no gradient" CELL IS NOT THIS ARM -- use `tds` with guidance_scale=0, which keeps
+    # the 2-event window and so isolates the proposal alone.
+    resample_windows: ""                # 6 resample events (0.2-0.8), NOT CAST's 2
+    guidance_max_rms_a: 6.0             # was absent -> 0.0, leaving the 700 A absolute rail active
+    guidance_max_norm: 0                # auto clip 6 is the house default; the absolute rail is off
+    # PINNED TO MATCH jobs/tts-steer-pool.yaml (SITE_HINGE=true, SITE_HUBER=4.0), which sets these
+    # on EVERY arm through $COMMON. Without them a run of this config outside the template falls
+    # back to the dataclass defaults (False / 0.0) and computes a DIFFERENT site reward. They are
+    # inert while this config's own reward is not a site reward, but the template can override
+    # the reward, so they must be present and agree.
+    site_hinge: true
+    site_huber_delta: 4.0
+    guidance_scale: 0.0                 # the FK reference has no gradient term -- that is TDS
+    lam_adaptive: true                  # calibrate the tilt once against a clean baseline
+    target_ess_frac: 0.4                # MUST stay below ess_fraction or resampling can never fire
+    potential: difference
+    resample: ess
+    ess_fraction: 0.5
+    resample_scheme: systematic          # was multinomial (the reference's); matches m2_tds
+    schedule_every: 20
+    schedule_start_frac: 0.25           # was 0.5; matches m2_tds
+    physicality_filter: false           # master switch OFF (ConforMix filtering injects clones and
+                                        # depresses the very diversity being measured)
+    phys_use_clash: false               # per-criterion gates, both OFF by default
+    phys_use_plddt: false               # ON costs one confidence pass per particle per event,
+                                        # counted into confidence_passes so FLOPs reflect it
+    mini_rollout_steps: 4

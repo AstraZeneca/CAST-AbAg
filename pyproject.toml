@@ -1,0 +1,73 @@
+[tool.poetry]
+name = "cast-abag"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "CAST: site-tilted test-time scaling for antibody-antigen co-folding (Protenix-v2 / OpenDDE)."
+authors = ["CAST-AbAg authors"]
+readme = "README.md"
+
+# Flat layout: every top-level package/module is included explicitly.
+packages = [
+    { include = "data" },
+    { include = "method" },
+    { include = "models" },
+    { include = "experiments" },
+    { include = "config.py" },      # config load/merge/resolve (top-level module)
+    { include = "results_io.py" },  # per-sample/per-target writers (top-level module)
+]
+# jobs/ holds the pool templates and tts_job_lib.py, which the README tells users to invoke.
+# It carries no __init__.py and is run by path, so it ships as data rather than as a package.
+include = [{ path = "jobs/**/*", format = ["sdist", "wheel"] }]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.12"
+# protenix is NOT a dep here — we never ``import protenix``. The backend shells out
+# to Protenix's ``runner/inference.py`` (inference) and the ``protenix msa`` CLI
+# (full-MSA-DB generation, data/msa/generate.py) in a separate venv at
+# $PROTENIX_COMPONENT_PATH. Re-add ``protenix = "^2.0.0"`` only if the code grows a
+# direct import.
+numpy = ">=1.24,<3"     # code is numpy-2 safe; production runs on 2.4.x (DockQ scoring uses a separate numpy<2 venv)
+pandas = "^2.0.0"       # per_sample / per_target frames (results_io, evaluate, run_ablation)
+pyarrow = "^15.0"       # parquet engine for pandas (per_sample.parquet) — required at runtime, not imported directly
+omegaconf = "^2.3.0"    # YAML config load / merge / ${env:...} interpolation (config.py)
+biopython = "^1.85"     # Bio.PDB.MMCIFParser — reads Cα coords + chains for ipSAE (models/protenix2.py)
+# biotite reads mmCIF/PDB structures. Required, not optional: the dataset loaders, the cif reader
+# and the biophysical signals all import it lazily, so the failure is at run time.
+biotite = "^1.0"
+tqdm = "^4.66.0"        # progress bar in experiments/scripts/evaluate.py
+
+# Removed vs prior: click / scipy / pyyaml — not imported anywhere in the codebase
+# (CLIs use argparse; YAML is handled by omegaconf; no scipy usage).
+
+[tool.poetry.group.guidance]
+optional = true
+
+[tool.poetry.group.guidance.dependencies]
+# Lazy-imported inside method.verifier.ipsae.soft_ipsae (the differentiable ipSAE
+# surrogate) and any diffusion-side gradient method (B4 guidance). The numpy path
+# (compute_ipsae + all metrics) works without it.
+torch = "^2.0"
+
+[tool.poetry.group.cdr]
+optional = true
+
+[tool.poetry.group.cdr.dependencies]
+# IMGT numbering for the CDR map (experiments/scripts/token_maps.py cdr-map). Pure python, so it
+# installs anywhere, but it SHELLS OUT to hmmscan, which is a C program and not a dependency poetry
+# can supply. Install HMMER from conda, apt or source. Do NOT rely on the PyPI `hmmer` package's
+# console scripts: they are wrappers, and HMMER writes argv[0] into its output header, which leaves
+# Biopython with no program match and every alignment coordinate None. Its bundled real binaries
+# under site-packages/hmmer/data/bin do work if --hmmer-path points straight at them.
+anarci = "*"
+
+# NOT HERE: DockQ. dockq 2.1.3 requires numpy<2.0, and poetry resolves one environment, so putting
+# it in any group pins the whole project to numpy 1.x while production runs 2.4.x. It stays in its
+# own venv, reached through $SCORE_PY and $SCORE_DOCKQ.
+
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
+pre-commit = "^4.6.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
