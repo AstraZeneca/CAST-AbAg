@@ -28,7 +28,7 @@ python = ">=3.11,<3.12"
 # direct import.
 numpy = ">=1.24,<3"     # code is numpy-2 safe; production runs on 2.4.x (DockQ scoring uses a separate numpy<2 venv)
 pandas = "^2.0.0"       # per_sample / per_target frames (results_io, evaluate, run_ablation)
-pyarrow = "^15.0"       # parquet engine for pandas (per_sample.parquet) — required at runtime, not imported directly
+pyarrow = ">=15,<24"       # parquet engine for pandas (per_sample.parquet) — required at runtime, not imported directly
 omegaconf = "^2.3.0"    # YAML config load / merge / ${env:...} interpolation (config.py)
 biopython = "^1.85"     # Bio.PDB.MMCIFParser — reads Cα coords + chains for ipSAE (models/protenix2.py)
 # biotite reads mmCIF/PDB structures. Required, not optional: the dataset loaders, the cif reader
